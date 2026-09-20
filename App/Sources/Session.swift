@@ -26,15 +26,10 @@ final class Session {
     /// search that asked for them by token. Late results from a previous
     /// search are dropped rather than mixed into the current list.
     private var activeToken: UInt32?
-    private var observers: [Task<Void, Never>] = []
 
     init() {
         observeConnection()
         observeSearch()
-    }
-
-    deinit {
-        for observer in observers { observer.cancel() }
     }
 
     var isConnected: Bool { status == .connected }
@@ -100,9 +95,14 @@ final class Session {
     // MARK: - Event observation
 
     private func observeConnection() {
-        observers.append(Task { [weak self] in
-            guard let self else { return }
-            for await event in client.events.connection.subscribe() {
+        // The channel is captured strongly and `self` weakly. Capturing self
+        // strongly for the life of the loop would be a cycle — Session owns
+        // the NetworkClient that owns the channel — and the loop never ends
+        // on its own.
+        let channel = client.events.connection
+        Task { [weak self] in
+            for await event in channel.subscribe() {
+                guard let self else { break }
                 switch event {
                 case .statusChanged(let newStatus):
                     self.status = newStatus
@@ -113,21 +113,22 @@ final class Session {
                     break
                 }
             }
-        })
+        }
     }
 
     private func observeSearch() {
         // A popular query can draw thousands of responses in seconds. Tail-drop
         // rather than let the buffer grow without bound — a missed result is a
         // missed row, not a broken transfer.
-        observers.append(Task { [weak self] in
-            guard let self else { return }
-            for await event in client.events.search.subscribe(bufferingPolicy: .bufferingOldest(4096)) {
+        let channel = client.events.search
+        Task { [weak self] in
+            for await event in channel.subscribe(bufferingPolicy: .bufferingOldest(4096)) {
+                guard let self else { break }
                 guard case .results(let token, let incoming) = event else { continue }
                 guard token == self.activeToken else { continue }
                 self.isSearching = false
                 self.results.append(contentsOf: incoming)
             }
-        })
+        }
     }
 }
