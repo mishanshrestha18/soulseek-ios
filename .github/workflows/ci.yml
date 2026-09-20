@@ -38,6 +38,7 @@ jobs:
         run: swift build
       - name: Test
         run: swift test
+        timeout-minutes: 10
 
   # The one that matters: proves SeeleseekCore actually compiles for iOS.
   ios-build:
@@ -69,9 +70,12 @@ jobs:
           UDID=$(xcrun simctl list devices available --json | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next(x['udid'] for rt, ds in sorted(d.items()) if 'iOS' in rt for x in ds))")
           echo "Using simulator $UDID"
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+      # Several tests drive real sockets and listeners. A wedged simulator
+      # hangs them indefinitely, which otherwise burns the full job timeout
+      # at the 10x macOS billing rate before reporting anything useful.
       - name: Test
         working-directory: Packages/SeeleseekCore
-        run: xcodebuild test -scheme SeeleseekCore -destination "id=${{ steps.sim.outputs.udid }}" TEST_RUNNER_CI=true
+        run: xcodebuild test -scheme SeeleseekCore -destination "id=${{ steps.sim.outputs.udid }}" -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 300 TEST_RUNNER_CI=true
 
   app-build:
     name: Build (app)
