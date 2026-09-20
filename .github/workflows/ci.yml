@@ -73,6 +73,12 @@ jobs:
       # Several tests drive real sockets and listeners. A wedged simulator
       # hangs them indefinitely, which otherwise burns the full job timeout
       # at the 10x macOS billing rate before reporting anything useful.
+      # Serialized on purpose. Run in parallel, tests across unrelated suites
+      # all hit the 120s limit together — including pure-logic ones — which is
+      # contention on a single simulator rather than any individual test being
+      # slow. Several tests here also drive real sockets and listeners, and
+      # they cannot share one simulator concurrently.
+      #
       # The workflow-level `CI` var reaches xcodebuild but NOT the test process
       # running inside the simulator, which is separately spawned. Without it,
       # LiveServerTests hits the real Soulseek server from a runner IP and the
@@ -83,7 +89,7 @@ jobs:
         working-directory: Packages/SeeleseekCore
         env:
           SIMCTL_CHILD_CI: "true"
-        run: xcodebuild test -scheme SeeleseekCore -destination "id=${{ steps.sim.outputs.udid }}" -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 300 TEST_RUNNER_CI=true
+        run: xcodebuild test -scheme SeeleseekCore -destination "id=${{ steps.sim.outputs.udid }}" -parallel-testing-enabled NO -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 300 TEST_RUNNER_CI=true
 
   app-build:
     name: Build (app)
