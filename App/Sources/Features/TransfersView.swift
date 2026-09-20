@@ -6,7 +6,8 @@ struct TransfersView: View {
 
     private var downloads: [Transfer] {
         // Newest first: the row you just queued is the one you want to see.
-        session.transfers.downloads.reversed()
+        // `reversed()` on an Array is a ReversedCollection view, not an Array.
+        Array(session.transfers.downloads.reversed())
     }
 
     var body: some View {
