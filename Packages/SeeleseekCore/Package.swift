@@ -35,7 +35,13 @@ let package = Package(
                 // Source: https://github.com/maxmind/MaxMind-DB/tree/main/test-data
                 .copy("Fixtures/GeoIP2-Country-Test.mmdb")
             ],
-            swiftSettings: swiftSettings
+            // These tests came from an app target built with
+            // SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor, so they call
+            // MainActor-isolated mocks from test functions that carry no
+            // explicit isolation. Matching that setting here keeps them
+            // compiling unmodified instead of annotating several hundred
+            // call sites.
+            swiftSettings: swiftSettings + [.defaultIsolation(MainActor.self)]
         )
     ]
 )

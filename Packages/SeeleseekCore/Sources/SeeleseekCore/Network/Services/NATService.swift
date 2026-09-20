@@ -1005,22 +1005,22 @@ public actor NATService {
         return preferred ?? fallback
     }
 
-    /// Currently-active default IPv4 gateway.
+    /// Currently-active default IPv4 gateway via SystemConfiguration's
+    /// `State:/Network/Global/IPv4` dictionary. Falls back to the `.1` on /24
+    /// heuristic if SC lookup fails.
     ///
-    /// SystemConfiguration's `State:/Network/Global/IPv4` dictionary is the
-    /// authoritative answer, but `SCDynamicStore` is macOS-only, so iOS reads
-    /// the kernel routing table instead. Both paths fall back to the `.1` on
-    /// /24 heuristic, which is wrong often enough that callers must treat a
-    /// mapping failure as normal rather than exceptional.
+    /// `SCDynamicStore` is macOS-only, and the portable alternative — walking
+    /// the kernel routing table via `sysctl(NET_RT_FLAGS)` — needs
+    /// `rt_msghdr`, which Darwin does not export to Swift on iOS. Since the
+    /// gateway is only wanted for UPnP/NAT-PMP mapping, which only pays off on
+    /// Wi-Fi behind a consumer router, iOS goes straight to the heuristic.
+    /// Guessing wrong costs a failed mapping, and peer connections then use
+    /// the server-brokered indirect path — already the normal case on cellular.
     static func getDefaultGateway() -> String? {
         #if os(macOS)
         if let store = SCDynamicStoreCreate(nil, "com.seeleseek.NATService" as CFString, nil, nil),
            let value = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
            let router = value["Router"] as? String {
-            return router
-        }
-        #else
-        if let router = defaultGatewayFromRoutingTable() {
             return router
         }
         #endif
@@ -1032,106 +1032,6 @@ public actor NATService {
             }
         }
         return nil
-    }
-
-    // `net/route.h` macros are not reliably surfaced to Swift across SDKs, so
-    // the ones needed here are restated. They are ABI, not implementation
-    // details, and have been stable since 4.4BSD.
-    private static let netRTFlags: Int32 = 2      // NET_RT_FLAGS
-    private static let rtfGateway: Int32 = 0x2    // RTF_GATEWAY
-    private static let rtaxDst = 0                // RTAX_DST
-    private static let rtaxGateway = 1            // RTAX_GATEWAY
-    private static let rtaxMax = 8                // RTAX_MAX
-
-    /// Gateway of the default IPv4 route, read from the kernel routing table.
-    ///
-    /// The iOS substitute for `SCDynamicStore`. `sysctl(NET_RT_FLAGS)` returns
-    /// a packed sequence of `rt_msghdr` records, each followed by a variable
-    /// number of `sockaddr`s. Which ones are present is described by the
-    /// `rtm_addrs` bitmask, and each is padded up to a 4-byte boundary, so the
-    /// list has to be walked in order rather than indexed.
-    static func defaultGatewayFromRoutingTable() -> String? {
-        var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, AF_INET, netRTFlags, rtfGateway]
-        var needed = 0
-
-        guard sysctl(&mib, u_int(mib.count), nil, &needed, nil, 0) == 0, needed > 0 else {
-            return nil
-        }
-
-        var buffer = [UInt8](repeating: 0, count: needed)
-        // The table can change size between the sizing call and this one. A
-        // short read would be parsed as garbage, so treat any failure as
-        // "no answer" and let the caller fall back.
-        guard sysctl(&mib, u_int(mib.count), &buffer, &needed, nil, 0) == 0 else {
-            return nil
-        }
-
-        let headerSize = MemoryLayout<rt_msghdr>.size
-
-        return buffer.withUnsafeBytes { raw -> String? in
-            var offset = 0
-
-            while offset + headerSize <= needed {
-                // Records are packed without regard to Swift's alignment
-                // requirements, hence loadUnaligned throughout.
-                let header = raw.loadUnaligned(fromByteOffset: offset, as: rt_msghdr.self)
-                let messageLength = Int(header.rtm_msglen)
-                guard messageLength >= headerSize, offset + messageLength <= needed else { break }
-
-                if header.rtm_flags & rtfGateway != 0 {
-                    var cursor = offset + headerSize
-                    var isDefaultRoute = false
-                    var gateway: String?
-
-                    for index in 0..<rtaxMax {
-                        guard header.rtm_addrs & (1 << Int32(index)) != 0 else { continue }
-                        guard cursor + MemoryLayout<sockaddr>.size <= offset + messageLength else { break }
-
-                        let address = raw.loadUnaligned(fromByteOffset: cursor, as: sockaddr.self)
-                        let length = Int(address.sa_len)
-
-                        switch index {
-                        case rtaxDst:
-                            // The default route's destination is 0.0.0.0, which
-                            // the kernel may encode as a zero-length sockaddr.
-                            isDefaultRoute = length == 0
-                                || ipv4String(raw, at: cursor, family: address.sa_family) == "0.0.0.0"
-                        case rtaxGateway:
-                            gateway = ipv4String(raw, at: cursor, family: address.sa_family)
-                        default:
-                            break
-                        }
-
-                        // SA_SIZE: zero-length sockaddrs still consume one word.
-                        cursor += length == 0 ? 4 : (length + 3) & ~3
-                    }
-
-                    if isDefaultRoute, let gateway, gateway != "0.0.0.0" {
-                        return gateway
-                    }
-                }
-
-                offset += messageLength
-            }
-
-            return nil
-        }
-    }
-
-    /// Renders a `sockaddr_in` at `offset` as dotted quad, or nil if it is not
-    /// IPv4. `sin_addr` is already network byte order, so the low byte of the
-    /// stored value is the first octet.
-    private static func ipv4String(
-        _ raw: UnsafeRawBufferPointer,
-        at offset: Int,
-        family: sa_family_t
-    ) -> String? {
-        guard family == sa_family_t(AF_INET),
-              offset + MemoryLayout<sockaddr_in>.size <= raw.count else { return nil }
-
-        let address = raw.loadUnaligned(fromByteOffset: offset, as: sockaddr_in.self)
-        let value = address.sin_addr.s_addr
-        return "\(value & 0xff).\((value >> 8) & 0xff).\((value >> 16) & 0xff).\((value >> 24) & 0xff)"
     }
 }
 

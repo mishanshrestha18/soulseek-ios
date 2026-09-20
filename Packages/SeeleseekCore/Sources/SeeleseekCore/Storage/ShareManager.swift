@@ -7,6 +7,19 @@ import os
 /// shares-settings UI observes the `state` mirror; peer search reads the
 /// lock-protected `ShareSearchSnapshot` via nonisolated `search`.
 public actor ShareManager {
+
+    // `.withSecurityScope` is macOS-only. On iOS the URLs that need a bookmark
+    // come from the document picker and are already security-scoped, so the
+    // default options persist the same access — `startAccessingSecurityScopedResource()`
+    // on the resolved URL behaves identically.
+    #if os(macOS)
+    private static let bookmarkCreationOptions: URL.BookmarkCreationOptions = .withSecurityScope
+    private static let bookmarkResolutionOptions: URL.BookmarkResolutionOptions = .withSecurityScope
+    #else
+    private static let bookmarkCreationOptions: URL.BookmarkCreationOptions = []
+    private static let bookmarkResolutionOptions: URL.BookmarkResolutionOptions = []
+    #endif
+
     nonisolated let logger = Logger(subsystem: "com.seeleseek", category: "ShareManager")
 
     // MARK: - State
@@ -261,7 +274,7 @@ public actor ShareManager {
             // Store bookmark for persistence
             do {
                 let bookmarkData = try url.bookmarkData(
-                    options: .withSecurityScope,
+                    options: Self.bookmarkCreationOptions,
                     includingResourceValuesForKeys: nil,
                     relativeTo: nil
                 )
@@ -488,7 +501,7 @@ public actor ShareManager {
             var isStale = false
             if let url = try? URL(
                 resolvingBookmarkData: bookmarkData,
-                options: .withSecurityScope,
+                options: Self.bookmarkResolutionOptions,
                 relativeTo: nil,
                 bookmarkDataIsStale: &isStale
             ), url.startAccessingSecurityScopedResource() {

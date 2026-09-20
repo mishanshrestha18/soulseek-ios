@@ -15,19 +15,30 @@ Update this file *and* `NOTICE.md` whenever the pin moves.
 Every divergence from upstream lives in `Patches/` and is listed here. Adding
 one without a matching entry is how a sync silently loses a fix.
 
-### `0001-ios-default-gateway.patch`
+### `0001-ios-portability.patch`
 
-`NATService.getDefaultGateway()` used `SCDynamicStoreCreate` /
-`SCDynamicStoreCopyValue`, which are macOS-only — the two symbols were the
-*only* thing preventing `SeeleseekCore` from compiling for iOS, despite the
-package already declaring `.iOS(.v18)`.
+Two macOS-only APIs were the entire reason `SeeleseekCore` could not build for
+iOS, despite the package already declaring `.iOS(.v18)`:
 
-The macOS path is unchanged, behind `#if os(macOS)`. Other platforms read the
-default route's gateway out of the kernel routing table via
-`sysctl(NET_RT_FLAGS)`. Both still fall back to the pre-existing `.1` on /24
-heuristic.
+- `NATService.getDefaultGateway()` used `SCDynamicStoreCreate` /
+  `SCDynamicStoreCopyValue`. Now behind `#if os(macOS)`; other platforms use
+  the `.1` on /24 fallback that was already there. Walking the kernel routing
+  table via `sysctl(NET_RT_FLAGS)` was tried first and abandoned — `rt_msghdr`
+  is not exported to Swift on iOS, and hand-rolling the struct layout is not
+  worth it for a value only used to attempt a UPnP mapping.
+- `ShareManager` passed `.withSecurityScope` to `bookmarkData(options:)` and
+  `URL(resolvingBookmarkData:options:)`. Both options are macOS-only; iOS uses
+  `[]`, which persists document-picker URLs equivalently.
 
 Worth sending upstream: the package claims iOS support it does not have.
+
+### `Package.swift`: test target isolation
+
+Not in `Patches/` since `Package.swift` is not part of the vendored Sources
+tree. The test target sets `.defaultIsolation(MainActor.self)` because the
+ported tests were written under the app target's
+`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, and call MainActor-isolated mocks
+from test functions with no explicit isolation.
 
 ## Procedure
 
