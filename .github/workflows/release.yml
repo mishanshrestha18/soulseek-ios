@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    name: Unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: App
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      # Built without a signature on purpose. Signing needs an Apple-issued
+      # certificate tied to an Apple ID, which does not belong in CI for a
+      # sideloaded app — Sideloadly or AltServer applies the user's own
+      # signature at install time instead.
+      - name: Archive
+        run: xcodebuild archive -project Soulseek.xcodeproj -scheme Soulseek -configuration Release -archivePath build/Soulseek.xcarchive -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      # An .ipa is just a zip with the .app inside a top-level Payload folder.
+      # `xcodebuild -exportArchive` refuses to run without signing settings,
+      # so the package is assembled directly.
+      - name: Package
+        run: |
+          mkdir -p build/Payload
+          cp -R build/Soulseek.xcarchive/Products/Applications/Soulseek.app build/Payload/
+          cd build && zip -qry Soulseek-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Soulseek-unsigned-ipa
+          path: App/build/Soulseek-unsigned.ipa
+          retention-days: 30

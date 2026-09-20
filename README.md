@@ -115,6 +115,36 @@ truth:
     brew install xcodegen
     cd App && xcodegen generate && open Soulseek.xcodeproj
 
+## Installing on a device
+
+There is no App Store build and there will not be one. The app is sideloaded.
+
+Developer Mode does **not** let iOS run unsigned code — it only unlocks
+running development-signed apps and debugging. A signature from an
+Apple-issued certificate is still required. It does not require a Mac.
+
+1. Run the **Release** workflow (Actions tab, or push a `v*` tag) and download
+   the `Soulseek-unsigned-ipa` artifact.
+2. On Windows, install **Sideloadly** or **AltServer**. AltServer needs iTunes
+   and iCloud from apple.com — the Microsoft Store versions will not work.
+3. Connect the iPhone over USB and install the `.ipa`. The tool signs it with
+   your Apple ID as it installs.
+4. On the phone: Settings → Privacy & Security → **Developer Mode** → on, then
+   reboot when prompted.
+5. Settings → General → VPN & Device Management → trust the developer profile.
+
+A free Apple ID signs for **7 days** and allows 3 sideloaded apps at once;
+reinstall to renew, or let AltServer refresh it automatically over the
+network. A paid developer account signs for a year.
+
+## Accounts
+
+Soulseek has no separate signup — the server creates the account on your first
+successful login, and the app stores the credentials in the Keychain. There is
+no password reset and no recovery, so pick something you will not lose. Do not
+use a randomly generated username; the
+[server rules](https://www.slsknet.org/news/node/681) prohibit it.
+
 ## Roadmap
 
 - [x] **Phase 1** — core builds for iOS device + simulator
