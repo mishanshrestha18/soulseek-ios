@@ -8,10 +8,13 @@ import Foundation
 ///  - multi-waiter getPeerAddress coalescing
 ///  - TransferRequest routing ambiguity
 ///  - outbound NWParameters construction
+// The test target defaults to MainActor isolation, but the @Test macro
+// expands its traits in a nonisolated context, so this has to opt out. An
+// immutable Bool has nothing to race on.
 #if os(iOS)
-private let runningOnIOS = true
+private nonisolated(unsafe) let runningOnIOS = true
 #else
-private let runningOnIOS = false
+private nonisolated(unsafe) let runningOnIOS = false
 #endif
 
 @Suite("Peer Connectivity", .serialized)
