@@ -31,6 +31,14 @@ struct ShareCountNotificationTests {
     /// debounce so a second debounce-window-fire would have arrived.
     private static let quiescenceMillis = 400
 
+    /// A few assertions here prove an *absence* — that a cancelled subscriber
+    /// never fires — and absence cannot be polled for the way `waitForCounter`
+    /// polls for arrival. Those waits are therefore fixed, which makes them
+    /// the only genuinely load-sensitive part of this suite: a shared CI
+    /// runner can take far longer than a developer machine to run a
+    /// MainActor cleanup hop, and the wait expiring early reads as a failure.
+    private static let settleScale = ProcessInfo.processInfo.environment["CI"] != nil ? 8 : 1
+
     /// Subscribe to `countsChangesStream()` and feed each yield into the
     /// caller's `FireCounter`. Stream is allocated synchronously here so
     /// the continuation is registered before this function returns — the
@@ -138,7 +146,7 @@ struct ShareCountNotificationTests {
         cancelledTask.cancel()
         // `onTermination` hops to MainActor to remove the entry. Yield
         // the actor so the cleanup Task can run before we publish.
-        try? await Task.sleep(for: .milliseconds(100))
+        try? await Task.sleep(for: .milliseconds(100 * Self.settleScale))
 
         await shares.rescanAll()
         let observedKept = await waitForCounter(kept, toReach: 1)
@@ -168,7 +176,7 @@ struct ShareCountNotificationTests {
         // Wait for the trailing-edge yield to land, then settle long
         // enough for any rogue second yield to arrive too.
         _ = await waitForCounter(counter, toReach: 1)
-        try? await Task.sleep(for: .milliseconds(Self.quiescenceMillis))
+        try? await Task.sleep(for: .milliseconds(Self.quiescenceMillis * Self.settleScale))
 
         #expect(counter.value == 1, "5 rapid changes must coalesce into 1 yield")
     }
@@ -187,7 +195,7 @@ struct ShareCountNotificationTests {
         await shares.loadPersistedFolders()
         // No target value to poll for (we expect 0); just sleep long
         // enough to confirm no spurious yield arrives.
-        try? await Task.sleep(for: .milliseconds(Self.quiescenceMillis))
+        try? await Task.sleep(for: .milliseconds(Self.quiescenceMillis * Self.settleScale))
 
         #expect(counter.value == 0, "loadPersistedFolders must not yield — it doesn't change the file index")
     }

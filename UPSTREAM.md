@@ -65,5 +65,11 @@ rather than deleted, so they show up as skipped instead of disappearing.
 
 | Test | Skipped on | Why |
 |------|-----------|-----|
-| `ShareCountNotificationTests` — "Rapid changes coalesce…" | CI | Five rescans must land inside the debounce window; on shared runners they straddle it and a second trailing-edge yield is legitimate. Fails on the macOS host too. |
+| `ShareCountNotificationTests` — "Rapid changes coalesce…" | CI | Five rescans must all land inside the debounce window. On shared runners they straddle it and the second trailing-edge yield is correct behaviour, so the assertion is wrong rather than the code. Scaling the waits does not help — the window itself is the problem. Fails on the macOS host too. |
 | `PeerConnectivityTests` — "Unexpected server loss reconnects…" | iOS | Unexplained. Passes on macOS. On the simulator the client never reaches `.connected` against the loopback fake server. **Needs diagnosis** — reconnect is more important on mobile than on desktop. |
+
+The rest of that suite proves an absence (a cancelled subscriber never fires),
+which cannot be polled for the way arrival can, so those waits are fixed
+rather than adaptive. They are scaled 8x when `CI` is set; "Cancelling a
+consumer Task removes its continuation" failed on a loaded runner at the
+original 100ms.
