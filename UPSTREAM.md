@@ -1,14 +1,33 @@
 # Syncing with upstream seeleseek
 
-`Packages/SeeleseekCore/Sources/` is a verbatim vendor of upstream. Keep it
-that way — every local change to that tree is a merge conflict you pay for on
-every sync. Portability fixes belong upstream; send them there first.
+`Packages/SeeleseekCore/Sources/` is a near-verbatim vendor of upstream. Keep
+it that way — every local change to that tree is a merge conflict you pay for
+on every sync. Portability fixes belong upstream; send them there first.
 
 ## Pinned commit
 
     e504f377e7be76c5f6bfcab41600f8dc706acfd9   2026-09-19
 
 Update this file *and* `NOTICE.md` whenever the pin moves.
+
+## Local patches
+
+Every divergence from upstream lives in `Patches/` and is listed here. Adding
+one without a matching entry is how a sync silently loses a fix.
+
+### `0001-ios-default-gateway.patch`
+
+`NATService.getDefaultGateway()` used `SCDynamicStoreCreate` /
+`SCDynamicStoreCopyValue`, which are macOS-only — the two symbols were the
+*only* thing preventing `SeeleseekCore` from compiling for iOS, despite the
+package already declaring `.iOS(.v18)`.
+
+The macOS path is unchanged, behind `#if os(macOS)`. Other platforms read the
+default route's gateway out of the kernel routing table via
+`sysctl(NET_RT_FLAGS)`. Both still fall back to the pre-existing `.1` on /24
+heuristic.
+
+Worth sending upstream: the package claims iOS support it does not have.
 
 ## Procedure
 
