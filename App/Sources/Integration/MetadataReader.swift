@@ -11,11 +11,14 @@ nonisolated struct MetadataReader: MetadataReading {
             return nil
         }
 
-        async let artist = Self.string(from: items, key: .commonKeyArtist)
-        async let album = Self.string(from: items, key: .commonKeyAlbumName)
-        async let title = Self.string(from: items, key: .commonKeyTitle)
+        // Sequential rather than `async let`: AVMetadataItem is not Sendable,
+        // so handing `items` to concurrent child tasks is a data race. These
+        // are tag reads on an already-loaded array and cost nothing anyway.
+        let artist = await Self.string(from: items, key: .commonKeyArtist)
+        let album = await Self.string(from: items, key: .commonKeyAlbumName)
+        let title = await Self.string(from: items, key: .commonKeyTitle)
 
-        let metadata = await AudioFileMetadata(artist: artist, album: album, title: title)
+        let metadata = AudioFileMetadata(artist: artist, album: album, title: title)
         guard metadata.artist != nil || metadata.album != nil || metadata.title != nil else {
             return nil
         }

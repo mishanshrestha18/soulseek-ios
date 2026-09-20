@@ -25,18 +25,16 @@ struct ShareCountNotificationTests {
     /// can easily blow past 350 ms; polling against this ceiling lets the
     /// test return as soon as the expected value is reached without
     /// flaking when it isn't.
-    private static let yieldTimeoutMillis = 2_000
+    private static var yieldTimeoutMillis: Int { 2_000 * settleScale }
     /// Quiescence window after a counter reaches its target — long enough
     /// for any rogue second yield to land. Needs to be > the 200 ms
     /// debounce so a second debounce-window-fire would have arrived.
     private static let quiescenceMillis = 400
 
-    /// A few assertions here prove an *absence* — that a cancelled subscriber
-    /// never fires — and absence cannot be polled for the way `waitForCounter`
-    /// polls for arrival. Those waits are therefore fixed, which makes them
-    /// the only genuinely load-sensitive part of this suite: a shared CI
-    /// runner can take far longer than a developer machine to run a
-    /// MainActor cleanup hop, and the wait expiring early reads as a failure.
+    /// CI is far slower than a developer machine — individual tests in this
+    /// suite have taken 79s on the iOS simulator against ~6s on a macOS host
+    /// — so every wait here is scaled. Polling waits return as soon as the
+    /// value arrives, so a larger ceiling costs nothing when things are fast.
     private static let settleScale = ProcessInfo.processInfo.environment["CI"] != nil ? 8 : 1
 
     /// Subscribe to `countsChangesStream()` and feed each yield into the
@@ -142,6 +140,12 @@ struct ShareCountNotificationTests {
         let cancelledTask = consume(shares, into: cancelled)
         let keptTask = consume(shares, into: kept)
         defer { keptTask.cancel() }
+
+        // Park both consumers in `for await` first. Cancelling a Task that has
+        // not yet entered the loop exercises start-cancellation, not
+        // continuation teardown, and leaves the later yield racing the
+        // deregistration — which is how this failed on CI.
+        await primeConsumer()
 
         cancelledTask.cancel()
         // `onTermination` hops to MainActor to remove the entry. Yield

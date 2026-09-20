@@ -73,8 +73,16 @@ jobs:
       # Several tests drive real sockets and listeners. A wedged simulator
       # hangs them indefinitely, which otherwise burns the full job timeout
       # at the 10x macOS billing rate before reporting anything useful.
+      # The workflow-level `CI` var reaches xcodebuild but NOT the test process
+      # running inside the simulator, which is separately spawned. Without it,
+      # LiveServerTests hits the real Soulseek server from a runner IP and the
+      # CI-scaled waits stay at their local values. SIMCTL_CHILD_* is the
+      # documented way to push env into simulator-hosted processes;
+      # TEST_RUNNER_* covers the xctestrun path. Both are set deliberately.
       - name: Test
         working-directory: Packages/SeeleseekCore
+        env:
+          SIMCTL_CHILD_CI: "true"
         run: xcodebuild test -scheme SeeleseekCore -destination "id=${{ steps.sim.outputs.udid }}" -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 300 TEST_RUNNER_CI=true
 
   app-build:
