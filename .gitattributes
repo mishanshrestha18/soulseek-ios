@@ -1,0 +1,5 @@
+# CI runs on macOS; keep everything LF in the repo regardless of Windows
+# checkout settings.
+* text=auto eol=lf
+*.mmdb binary
+*.png binary
