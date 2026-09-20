@@ -121,8 +121,27 @@ truth:
 - [ ] **Phase 1b** — ported protocol tests green on host and simulator
 - [x] **Phase 2** — app shell: login, Keychain credentials, connection state
 - [ ] **Phase 3** — Search: live result streaming done; filter/sort/grouping to do
-- [ ] **Phase 4** — Download: queue, transfer UI, resume, file storage + Files.app export
+- [ ] **Phase 4** — Download: queue, transfer UI and resume written; **never compiled**
 - [ ] Later — uploads/sharing, audio player, chat and user browse
+
+## Integration contract
+
+`SeeleseekCore` expects the app to supply five conformances. Four are
+`@MainActor`; `MetadataReading` is not, so its implementation opts out of the
+app target's MainActor default isolation.
+
+| Protocol | App type | Notes |
+|---|---|---|
+| `TransferTracking` | `TransferStore` | `findSalvageableDownload` must stay O(1) in history size — it runs on every unsolicited TransferRequest — so lookups are indexed, not scanned. |
+| `StatisticsRecording` | `StatisticsStore` | Session totals only; no persistence yet. |
+| `DownloadSettingsProviding` | `DownloadSettings` | Pushed into `DownloadManager` as a value snapshot so its path logic stays synchronous. |
+| `MetadataReading` | `MetadataReader` | AVFoundation. `applyArtworkAsFolderIcon` always returns false — iOS has no folder icons. |
+| `ActivityLogging` | *not implemented* | Optional: core reaches it through `ActivityLogger.shared`, which stays nil. |
+
+`DownloadManager` subscribes to the event bus itself, so the app only calls
+`configure` and `queueDownload`. It holds its `UploadManager` weakly, so
+`Session` keeps the strong reference — uploads are not a v1 feature, but the
+manager must exist to answer peers that request files from us.
 
 ## Licensing
 

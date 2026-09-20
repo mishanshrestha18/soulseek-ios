@@ -12,7 +12,15 @@ struct SearchView: View {
                     emptyState
                 } else {
                     List(session.results) { result in
-                        SearchResultRow(result: result)
+                        // Tapping queues with the peer rather than starting a
+                        // transfer — the peer decides when a slot frees, so
+                        // the row shows up under Transfers as queued.
+                        Button {
+                            Task { await session.download(result) }
+                        } label: {
+                            SearchResultRow(result: result)
+                        }
+                        .buttonStyle(.plain)
                     }
                     .listStyle(.plain)
                 }

@@ -10,6 +10,8 @@ struct RootView: View {
                 TabView {
                     SearchView()
                         .tabItem { Label("Search", systemImage: "magnifyingglass") }
+                    TransfersView()
+                        .tabItem { Label("Transfers", systemImage: "arrow.down.circle") }
                     StatusView()
                         .tabItem { Label("Status", systemImage: "network") }
                 }
@@ -21,8 +23,7 @@ struct RootView: View {
     }
 }
 
-/// Placeholder for the transfers tab until downloads land. Also the only
-/// place the connection can currently be torn down.
+/// Connection detail, and the only place the session can be torn down.
 struct StatusView: View {
     @Environment(Session.self) private var session
 

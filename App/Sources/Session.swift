@@ -2,14 +2,14 @@ import Foundation
 import Observation
 import SeeleseekCore
 
-/// Owns the `NetworkClient` and republishes the parts of its event stream the
-/// UI observes. Everything here is MainActor; `NetworkClient` is an actor and
-/// is only touched through `await`.
+/// Owns the `NetworkClient` and the transfer managers, and republishes the
+/// parts of the event stream the UI observes. Everything here is MainActor;
+/// the core's actors are only touched through `await`.
 @MainActor
 @Observable
 final class Session {
-    /// The official server. Port 2242 is the modern one; 2240 is the legacy
-    /// port and is not used here.
+    /// The official server. Port 2242 is the modern one; 2240 is legacy and
+    /// is not used here.
     static let defaultServer = "server.slsknet.org"
     static let defaultPort: UInt16 = 2242
 
@@ -21,6 +21,16 @@ final class Session {
     private(set) var query = ""
 
     let client = NetworkClient()
+    let transfers = TransferStore()
+    let statistics = StatisticsStore()
+    let settings = DownloadSettings()
+
+    // DownloadManager holds its UploadManager weakly, so the strong reference
+    // has to live here or the upload side silently disappears. Uploads are
+    // not a v1 feature, but the manager still has to exist to answer peers
+    // that ask us for files.
+    private let uploadManager = UploadManager()
+    private let downloadManager = DownloadManager()
 
     /// Results arrive asynchronously from many peers and are matched to the
     /// search that asked for them by token. Late results from a previous
@@ -30,9 +40,43 @@ final class Session {
     init() {
         observeConnection()
         observeSearch()
+        configureManagers()
     }
 
     var isConnected: Bool { status == .connected }
+
+    // MARK: - Setup
+
+    private func configureManagers() {
+        let reader = MetadataReader()
+        let snapshot = settings.snapshot
+        let client = client
+        let transfers = transfers
+        let statistics = statistics
+        let uploadManager = uploadManager
+        let downloadManager = downloadManager
+
+        Task {
+            await client.setMetadataReader(reader)
+            await downloadManager.configure(
+                networkClient: client,
+                transferState: transfers,
+                statisticsState: statistics,
+                uploadManager: uploadManager,
+                settings: snapshot,
+                metadataReader: reader
+            )
+            await uploadManager.configure(
+                networkClient: client,
+                transferState: transfers,
+                shareManager: client.shareManager,
+                statisticsState: statistics
+            )
+            // Re-arms retry timers persisted by a previous run; without it a
+            // row left in .failed keeps a scheduled retry that never fires.
+            await downloadManager.rearmPersistedRetries()
+        }
+    }
 
     // MARK: - Connection
 
@@ -92,6 +136,23 @@ final class Session {
         isSearching = false
     }
 
+    // MARK: - Downloads
+
+    /// Queues the file with the peer. The peer answers with a TransferRequest
+    /// when a slot frees, which may be immediately or hours later — the row
+    /// appears in `transfers.downloads` straight away either way.
+    func download(_ result: SearchResult) async {
+        await downloadManager.queueDownload(from: result)
+    }
+
+    func cancelDownload(_ id: UUID) async {
+        await downloadManager.cancelDownload(transferId: id)
+    }
+
+    func retryDownload(_ id: UUID) async {
+        await downloadManager.retryFailedDownload(transferId: id)
+    }
+
     // MARK: - Event observation
 
     private func observeConnection() {
@@ -108,6 +169,11 @@ final class Session {
                     self.status = newStatus
                     if newStatus == .disconnected || newStatus == .error {
                         self.isSearching = false
+                    }
+                    if newStatus == .connected {
+                        // Downloads interrupted by a dropped connection resume
+                        // from their stored byte offset rather than restarting.
+                        await self.downloadManager.resumeDownloadsOnConnect()
                     }
                 case .protocolNotice:
                     break
