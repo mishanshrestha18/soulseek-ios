@@ -72,3 +72,21 @@ jobs:
       - name: Test
         working-directory: Packages/SeeleseekCore
         run: xcodebuild test -scheme SeeleseekCore -destination "id=${{ steps.sim.outputs.udid }}" TEST_RUNNER_CI=true
+
+  app-build:
+    name: Build (app)
+    runs-on: macos-26
+    timeout-minutes: 30
+    needs: ios-build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      # The .xcodeproj is generated, not committed — it cannot be opened or
+      # regenerated on the Windows machine this is developed on.
+      - name: Generate project
+        working-directory: App
+        run: xcodegen generate
+      - name: Build
+        working-directory: App
+        run: xcodebuild build -project Soulseek.xcodeproj -scheme Soulseek -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO

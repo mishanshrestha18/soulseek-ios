@@ -1,0 +1,60 @@
+# Generated into an .xcodeproj by XcodeGen. The project file itself is not
+# committed — it cannot be edited or regenerated on the Windows machine this
+# is developed on, so the YAML is the source of truth and CI generates the
+# rest. See README.md.
+name: Soulseek
+options:
+  bundleIdPrefix: com.example.soulseek
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+packages:
+  SeeleseekCore:
+    path: ../Packages/SeeleseekCore
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    # The app is UI-first; MainActor by default matches where nearly all of
+    # its code actually runs and keeps the SeeleseekCore actor boundaries as
+    # the only places isolation has to be reasoned about.
+    SWIFT_APPROACHABLE_CONCURRENCY: YES
+    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+
+targets:
+  Soulseek:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    dependencies:
+      - package: SeeleseekCore
+        product: SeeleseekCore
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleDisplayName: Soulseek
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # Peers on the same Wi-Fi are reached over the local network, which
+        # iOS gates behind an explicit prompt.
+        NSLocalNetworkUsageDescription: >-
+          Soulseek connects directly to other users to search for and transfer
+          files. Peers on your local network are reached over it.
+        ITSAppUsesNonExemptEncryption: false
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.soulseek.app
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: NO

@@ -76,10 +76,13 @@ Full reference: [SLSKPROTOCOL.md](https://github.com/nicotine-plus/nicotine-plus
 ## Architecture
 
     Packages/SeeleseekCore/   vendored protocol engine (MIT, upstream seeleseek)
-      Sources/                  verbatim — do not edit, see UPSTREAM.md
+      Sources/                  near-verbatim — see UPSTREAM.md before editing
       Tests/…/Protocol/         protocol tests lifted from upstream's app target
-    App/                      iOS SwiftUI app (not started)
-    .github/workflows/ci.yml  macOS runners: host tests, iOS build, iOS sim tests
+    App/
+      project.yml               XcodeGen spec — the .xcodeproj is NOT committed
+      Sources/                  iOS SwiftUI app
+    Patches/                  every divergence from upstream, one file each
+    .github/workflows/ci.yml  macOS runners: host tests, iOS build/test, app build
 
 `SeeleseekCore` is 21k lines of Swift 6 with **zero external dependencies**,
 built on `Network.framework` (`NWConnection`/`NWListener`), `Synchronization`,
@@ -105,11 +108,19 @@ iOS compile check:
     cd Packages/SeeleseekCore
     xcodebuild build -scheme SeeleseekCore -destination 'generic/platform=iOS Simulator'
 
+The app's `.xcodeproj` is generated rather than committed, because it can be
+neither opened nor regenerated on Windows. `App/project.yml` is the source of
+truth:
+
+    brew install xcodegen
+    cd App && xcodegen generate && open Soulseek.xcodeproj
+
 ## Roadmap
 
-- [ ] **Phase 1** — CI green: core builds for iOS device + simulator, tests pass
-- [ ] **Phase 2** — iOS app shell: login, keychain credential storage, connection state
-- [ ] **Phase 3** — Search: query, live result streaming, filter/sort, result grouping
+- [x] **Phase 1** — core builds for iOS device + simulator
+- [ ] **Phase 1b** — ported protocol tests green on host and simulator
+- [x] **Phase 2** — app shell: login, Keychain credentials, connection state
+- [ ] **Phase 3** — Search: live result streaming done; filter/sort/grouping to do
 - [ ] **Phase 4** — Download: queue, transfer UI, resume, file storage + Files.app export
 - [ ] Later — uploads/sharing, audio player, chat and user browse
 
