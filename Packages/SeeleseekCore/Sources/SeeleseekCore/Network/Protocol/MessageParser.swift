@@ -1,0 +1,1213 @@
+import Foundation
+import os
+
+/// Parser for SoulSeek protocol messages.
+/// All types are Sendable to allow use across actor boundaries.
+public enum MessageParser {
+    nonisolated static let logger = Logger(subsystem: "com.seeleseek", category: "MessageParser")
+
+    // MARK: - Security Limits
+    // These limits prevent DoS attacks via malicious payloads with large counts
+
+    /// Maximum number of items in any list (files, rooms, users, etc.)
+    nonisolated static let maxItemCount: UInt32 = 100_000
+    /// Maximum number of attributes per file
+    nonisolated static let maxAttributeCount: UInt32 = 100
+
+    /// Count guard for size-bounded lists (share lists, folder contents) —
+    /// a fixed cap rejects real 250k+-directory shares. Every entry consumes
+    /// at least `minBytesPerItem`, so any count the remaining payload cannot
+    /// hold is a lie.
+    private nonisolated static func plausibleItemCount(
+        _ count: UInt32, at offset: Int, in data: Data, minBytesPerItem: Int = 8
+    ) -> Bool {
+        count <= UInt32(clamping: (data.count - offset) / minBytesPerItem)
+    }
+    /// Maximum message size — large share lists can exceed 10MB compressed.
+    public nonisolated static let maxMessageSize: UInt32 = 100_000_000  // 100MB
+
+    // MARK: - Frame Parsing
+
+    public struct ParsedFrame: Sendable, Equatable {
+        public let code: UInt32
+        public let payload: Data
+    }
+
+    public nonisolated static func parseFrame(from data: Data) -> (frame: ParsedFrame, consumed: Int)? {
+        guard data.count >= 8 else { return nil }
+
+        guard let length = data.readUInt32(at: 0) else { return nil }
+
+        // SECURITY: Reject excessively large messages
+        guard length <= maxMessageSize else { return nil }
+
+        // Message must contain at least a 4-byte code
+        guard length >= 4 else { return nil }
+
+        let totalLength = 4 + Int(length)
+
+        guard data.count >= totalLength else { return nil }
+        guard let code = data.readUInt32(at: 4) else { return nil }
+
+        // Use safe subdata extraction
+        guard let payload = data.safeSubdata(in: 8..<totalLength) else { return nil }
+        return (ParsedFrame(code: code, payload: payload), totalLength)
+    }
+
+    // MARK: - Server Message Parsing
+
+    public nonisolated static func parseLoginResponse(_ payload: Data) -> LoginResult? {
+        var offset = 0
+
+        guard let success = payload.readBool(at: offset) else { return nil }
+        offset += 1
+
+        if success {
+            guard let (greeting, greetingLen) = payload.readString(at: offset) else { return nil }
+            offset += greetingLen
+
+            guard let ip = payload.readUInt32(at: offset) else { return nil }
+            offset += 4
+
+            let ipString = formatLittleEndianIPv4(ip)
+
+            var hashString: String?
+            if let (hash, _) = payload.readString(at: offset) {
+                hashString = hash
+            }
+
+            return .success(greeting: greeting, ip: ipString, hash: hashString)
+        } else {
+            guard let (reason, _) = payload.readString(at: offset) else {
+                return .failure(reason: "Unknown error")
+            }
+            return .failure(reason: reason)
+        }
+    }
+
+    public struct RoomListEntry: Sendable, Equatable {
+        public let name: String
+        public let userCount: UInt32
+    }
+
+    public struct RoomListInfo: Sendable, Equatable {
+        public let publicRooms: [RoomListEntry]
+        public let ownedPrivate: [RoomListEntry]
+        public let memberPrivate: [RoomListEntry]
+        /// Rooms where we are an operator; payload only carries names, no counts.
+        public let operatedPrivate: [String]
+    }
+
+    /// Parse RoomList payload (code 64). Returns all four sections per spec.
+    /// Sections after `publicRooms` are absent on older responses — absence
+    /// means the payload ends exactly at the section boundary. A section that
+    /// is present but malformed stops parsing (the offset is unrecoverable
+    /// once misaligned); we keep the sections already parsed rather than
+    /// decoding garbage into the later ones.
+    public nonisolated static func parseRoomList(_ payload: Data) -> RoomListInfo? {
+        var offset = 0
+
+        guard let publicRooms = readRoomNamesAndCounts(payload, offset: &offset) else {
+            return nil
+        }
+
+        var ownedPrivate: [RoomListEntry] = []
+        var memberPrivate: [RoomListEntry] = []
+        var operatedPrivate: [String] = []
+
+        parseTail: if offset < payload.count {
+            guard let owned = readRoomNamesAndCounts(payload, offset: &offset) else {
+                logger.warning("RoomList: malformed owned-private section, dropping tail")
+                break parseTail
+            }
+            ownedPrivate = owned
+            if offset >= payload.count { break parseTail }
+
+            guard let member = readRoomNamesAndCounts(payload, offset: &offset) else {
+                logger.warning("RoomList: malformed member-private section, dropping tail")
+                break parseTail
+            }
+            memberPrivate = member
+            if offset >= payload.count { break parseTail }
+
+            // Operator room section: names only (no user counts).
+            guard let opCount = payload.readUInt32(at: offset), opCount <= maxItemCount else {
+                logger.warning("RoomList: malformed operator section, dropping tail")
+                break parseTail
+            }
+            offset += 4
+            for _ in 0..<opCount {
+                guard let (name, len) = payload.readString(at: offset) else {
+                    logger.warning("RoomList: truncated operator room name")
+                    operatedPrivate = []
+                    break parseTail
+                }
+                operatedPrivate.append(name)
+                offset += len
+            }
+        }
+
+        return RoomListInfo(
+            publicRooms: publicRooms,
+            ownedPrivate: ownedPrivate,
+            memberPrivate: memberPrivate,
+            operatedPrivate: operatedPrivate
+        )
+    }
+
+    /// Shared helper: reads `count + names[]` followed by `count + counts[]` —
+    /// the pattern used for public, owned-private, and member-private sections.
+    /// Returns nil on any malformation; `offset` is only valid on success.
+    private nonisolated static func readRoomNamesAndCounts(_ payload: Data, offset: inout Int) -> [RoomListEntry]? {
+        guard let roomCount = payload.readUInt32(at: offset) else { return nil }
+        guard roomCount <= maxItemCount else { return nil }
+        offset += 4
+
+        var names: [String] = []
+        for _ in 0..<roomCount {
+            guard let (name, len) = payload.readString(at: offset) else { return nil }
+            offset += len
+            names.append(name)
+        }
+
+        guard let userCountsCount = payload.readUInt32(at: offset) else { return nil }
+        guard userCountsCount <= maxItemCount else { return nil }
+        offset += 4
+
+        var counts: [UInt32] = []
+        for _ in 0..<userCountsCount {
+            guard let count = payload.readUInt32(at: offset) else { return nil }
+            counts.append(count)
+            offset += 4
+        }
+
+        return names.enumerated().map { index, name in
+            let userCount = index < counts.count ? counts[index] : 0
+            return RoomListEntry(name: name, userCount: userCount)
+        }
+    }
+
+    public struct PeerInfo: Sendable, Equatable {
+        public let username: String
+        /// "P" (peer), "F" (file transfer), "D" (distributed) per spec.
+        public let connectionType: String
+        public let ip: String
+        public let port: UInt32
+        public let token: UInt32
+        public let privileged: Bool
+        /// Trailing ConnectToPeer fields (0 when the server omits them):
+        /// the peer's obfuscation support and its obfuscated listen port.
+        public var obfuscationType: UInt32 = 0
+        public var obfuscatedPort: UInt32 = 0
+    }
+
+    public nonisolated static func parseConnectToPeer(_ payload: Data) -> PeerInfo? {
+        var offset = 0
+
+        guard let (username, usernameLen) = payload.readString(at: offset) else { return nil }
+        offset += usernameLen
+
+        guard let (connectionType, typeLen) = payload.readString(at: offset) else { return nil }
+        offset += typeLen
+
+        guard let ip = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let port = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let token = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        let privileged = payload.readBool(at: offset) ?? false
+        offset += 1
+
+        // Trailing fields (spec fields 7-8); older servers may omit them.
+        let obfuscationType = payload.readUInt32(at: offset) ?? 0
+        offset += 4
+        let obfuscatedPort = payload.readUInt32(at: offset) ?? 0
+
+        let ipString = formatLittleEndianIPv4(ip)
+
+        return PeerInfo(
+            username: username,
+            connectionType: connectionType,
+            ip: ipString,
+            port: port,
+            token: token,
+            privileged: privileged,
+            obfuscationType: obfuscationType,
+            obfuscatedPort: obfuscatedPort
+        )
+    }
+
+    nonisolated private static func formatLittleEndianIPv4(_ ip: UInt32) -> String {
+        // IP is stored in network byte order (big-endian) within a LE uint32:
+        // high byte = first octet
+        let b1 = (ip >> 24) & 0xFF
+        let b2 = (ip >> 16) & 0xFF
+        let b3 = (ip >> 8) & 0xFF
+        let b4 = ip & 0xFF
+        return "\(b1).\(b2).\(b3).\(b4)"
+    }
+
+    public struct UserStatusInfo: Sendable, Equatable {
+        public let username: String
+        public let status: UserStatus
+        public let privileged: Bool
+    }
+
+    public nonisolated static func parseGetUserStatus(_ payload: Data) -> UserStatusInfo? {
+        var offset = 0
+
+        guard let (username, usernameLen) = payload.readString(at: offset) else { return nil }
+        offset += usernameLen
+
+        guard let statusRaw = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        let privileged = payload.readBool(at: offset) ?? false
+
+        let status = UserStatus(rawValue: statusRaw) ?? .offline
+
+        return UserStatusInfo(username: username, status: status, privileged: privileged)
+    }
+
+    public struct PrivateMessageInfo: Sendable, Equatable {
+        public let id: UInt32
+        public let timestamp: UInt32
+        public let username: String
+        public let message: String
+        /// True if this message is being delivered in real time; false if it
+        /// is a re-send for a recipient who was offline when it was first sent
+        /// (matches the wire-level "new message" flag from the spec).
+        public let isNewMessage: Bool
+    }
+
+    public nonisolated static func parsePrivateMessage(_ payload: Data) -> PrivateMessageInfo? {
+        var offset = 0
+
+        guard let id = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let timestamp = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let (username, usernameLen) = payload.readString(at: offset) else { return nil }
+        offset += usernameLen
+
+        guard let (message, messageLen) = payload.readString(at: offset) else { return nil }
+        offset += messageLen
+
+        // Spec: trailing bool is "new message" — true for live delivery,
+        // false when the server is replaying a queued message for an
+        // offline recipient. If absent we assume live (most common case).
+        let isNewMessage = payload.readBool(at: offset) ?? true
+
+        return PrivateMessageInfo(id: id, timestamp: timestamp, username: username, message: message, isNewMessage: isNewMessage)
+    }
+
+    public struct ChatRoomMessageInfo: Sendable, Equatable {
+        public let roomName: String
+        public let username: String
+        public let message: String
+    }
+
+    public nonisolated static func parseSayInChatRoom(_ payload: Data) -> ChatRoomMessageInfo? {
+        var offset = 0
+
+        guard let (roomName, roomLen) = payload.readString(at: offset) else { return nil }
+        offset += roomLen
+
+        guard let (username, usernameLen) = payload.readString(at: offset) else { return nil }
+        offset += usernameLen
+
+        guard let (message, _) = payload.readString(at: offset) else { return nil }
+
+        return ChatRoomMessageInfo(roomName: roomName, username: username, message: message)
+    }
+
+    // MARK: - Peer Message Parsing
+
+    public struct SearchResultFile: Sendable, Equatable {
+        public let filename: String
+        public let size: UInt64
+        public let `extension`: String
+        public let attributes: [FileAttribute]
+        public let isPrivate: Bool  // Buddy-only / locked file
+
+        public nonisolated init(filename: String, size: UInt64, extension: String, attributes: [FileAttribute], isPrivate: Bool = false) {
+            self.filename = filename
+            self.size = size
+            self.extension = `extension`
+            self.attributes = attributes
+            self.isPrivate = isPrivate
+        }
+    }
+
+    public struct FileAttribute: Sendable, Equatable {
+        public let type: UInt32
+        public let value: UInt32
+
+        public var description: String {
+            switch type {
+            case 0: "Bitrate: \(value) kbps"
+            case 1: "Duration: \(value) seconds"
+            case 2: "VBR: \(value == 1 ? "Yes" : "No")"
+            case 4: "Sample Rate: \(value) Hz"
+            case 5: "Bit Depth: \(value) bits"
+            default: "Unknown(\(type)): \(value)"
+            }
+        }
+    }
+
+    // MARK: - Shared file-entry readers
+    // One file entry is `uint8 code, string filename, uint64 size, string ext,
+    // uint32 attrCount, (uint32 type, uint32 value)*` — identical across
+    // SearchReply (public + private sections), SharesReply, and
+    // FolderContentsReply. On failure `offset` is mid-entry and unusable;
+    // callers must stop parsing the section (never continue an outer loop).
+
+    private nonisolated static func readFileAttributes(_ payload: Data, offset: inout Int) -> [FileAttribute]? {
+        guard let attrCount = payload.readUInt32(at: offset), attrCount <= maxAttributeCount else { return nil }
+        offset += 4
+
+        var attributes: [FileAttribute] = []
+        for _ in 0..<attrCount {
+            guard let attrType = payload.readUInt32(at: offset) else { return nil }
+            offset += 4
+            guard let attrValue = payload.readUInt32(at: offset) else { return nil }
+            offset += 4
+            attributes.append(FileAttribute(type: attrType, value: attrValue))
+        }
+        return attributes
+    }
+
+    private nonisolated static func readSearchFileEntry(_ payload: Data, offset: inout Int, isPrivate: Bool) -> SearchResultFile? {
+        guard payload.readUInt8(at: offset) != nil else { return nil }
+        offset += 1
+
+        guard let (filename, filenameLen) = payload.readString(at: offset) else { return nil }
+        offset += filenameLen
+
+        guard let size = payload.readUInt64(at: offset) else { return nil }
+        offset += 8
+
+        guard let (ext, extLen) = payload.readString(at: offset) else { return nil }
+        offset += extLen
+
+        guard let attributes = readFileAttributes(payload, offset: &offset) else { return nil }
+
+        return SearchResultFile(filename: filename, size: size, extension: ext, attributes: attributes, isPrivate: isPrivate)
+    }
+
+    /// Same wire layout as `readSearchFileEntry`, projected into `ShareFileInfo`
+    /// (bitrate/duration pulled out of the attribute list). `dirName`, when
+    /// present, is prepended with the SoulSeek path separator.
+    private nonisolated static func readShareFileEntry(_ payload: Data, offset: inout Int, dirName: String?, isPrivate: Bool) -> ShareFileInfo? {
+        guard payload.readUInt8(at: offset) != nil else { return nil }
+        offset += 1
+
+        guard let (filename, filenameLen) = payload.readString(at: offset) else { return nil }
+        offset += filenameLen
+
+        guard let size = payload.readUInt64(at: offset) else { return nil }
+        offset += 8
+
+        guard let (_, extLen) = payload.readString(at: offset) else { return nil }
+        offset += extLen
+
+        guard let attributes = readFileAttributes(payload, offset: &offset) else { return nil }
+
+        var bitrate: UInt32?
+        var duration: UInt32?
+        for attr in attributes {
+            switch attr.type {
+            case 0: bitrate = attr.value
+            case 1: duration = attr.value
+            default: break
+            }
+        }
+
+        let fullName = dirName.map { "\($0)\\\(filename)" } ?? filename
+        return ShareFileInfo(filename: fullName, size: size, bitrate: bitrate, duration: duration, isPrivate: isPrivate)
+    }
+
+    public struct SearchReplyInfo: Sendable, Equatable {
+        public let username: String
+        public let token: UInt32
+        public let files: [SearchResultFile]
+        public let freeSlots: Bool
+        public let uploadSpeed: UInt32
+        public let queueLength: UInt32
+    }
+
+    public nonisolated static func parseSearchReply(_ payload: Data) -> SearchReplyInfo? {
+        var offset = 0
+
+        guard let (username, usernameLen) = payload.readString(at: offset) else { return nil }
+        offset += usernameLen
+
+        guard let token = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let fileCount = payload.readUInt32(at: offset) else { return nil }
+        // SECURITY: Limit file count to prevent DoS
+        guard fileCount <= maxItemCount else { return nil }
+        offset += 4
+
+        var files: [SearchResultFile] = []
+        for _ in 0..<fileCount {
+            guard let file = readSearchFileEntry(payload, offset: &offset, isPrivate: false) else { return nil }
+            files.append(file)
+        }
+
+        // Slot/speed/queue fields are mandatory per spec (Peer Code 9). A
+        // truncated message must not default to freeSlots=true — download
+        // scheduling would treat the peer as advertising a slot it never did.
+        guard let freeSlots = payload.readBool(at: offset) else { return nil }
+        offset += 1
+
+        guard let uploadSpeed = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let queueLength = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        // Parse privately shared results (buddy-only files)
+        // These come after the regular file list and are only visible if we're on the user's buddy list
+        // Format: uint32 unknown (always 0), uint32 private file count, then file entries
+        // Skip the "unknown" uint32 first
+        offset += 4
+
+        let remainingBytes = payload.count - offset
+        if remainingBytes >= 4 {
+            let potentialPrivateCount = payload.readUInt32(at: offset) ?? 0
+
+            // Validate: private file count should be reasonable (not garbage data)
+            // SECURITY: Limit private file count
+            if potentialPrivateCount > 0 && potentialPrivateCount <= maxItemCount {
+                offset += 4
+
+                // Lenient: the private tail is optional and some clients omit
+                // or truncate it — stop at the first malformed entry but keep
+                // the public results already parsed.
+                for _ in 0..<potentialPrivateCount {
+                    guard let file = readSearchFileEntry(payload, offset: &offset, isPrivate: true) else { break }
+                    files.append(file)
+                }
+            }
+        }
+
+        return SearchReplyInfo(
+            username: username,
+            token: token,
+            files: files,
+            freeSlots: freeSlots,
+            uploadSpeed: uploadSpeed,
+            queueLength: queueLength
+        )
+    }
+
+    public struct TransferRequestInfo: Sendable, Equatable {
+        public let direction: FileTransferDirection
+        public let token: UInt32
+        public let filename: String
+        public let fileSize: UInt64?
+    }
+
+    public nonisolated static func parseTransferRequest(_ payload: Data) -> TransferRequestInfo? {
+        var offset = 0
+
+        guard let directionRaw = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let directionByte = UInt8(exactly: directionRaw),
+              let direction = FileTransferDirection(rawValue: directionByte) else {
+            logger.warning("TransferRequest: invalid direction \(directionRaw)")
+            return nil
+        }
+
+        guard let token = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let (filename, filenameLen) = payload.readString(at: offset) else { return nil }
+        offset += filenameLen
+
+        var fileSize: UInt64?
+        if direction == .upload {
+            // For upload direction (peer wants to upload to us), file size
+            // is mandatory per protocol — it tells us how many bytes the
+            // F connection will deliver. Reject the parse when it's missing
+            // rather than returning nil fileSize, which downstream callers
+            // coerced to 0, making a truncated TransferRequest look like a
+            // valid empty-file transfer. Zero-byte files ARE legal shares
+            // (slskd/Seeker advertise size 0), so 0 itself is accepted.
+            guard let parsed = payload.readUInt64(at: offset) else {
+                logger.warning("TransferRequest: truncated before mandatory fileSize (token \(token))")
+                return nil
+            }
+            fileSize = parsed
+        }
+
+        return TransferRequestInfo(direction: direction, token: token, filename: filename, fileSize: fileSize)
+    }
+
+    // MARK: - Peer Message Parsing (Extended)
+
+    public struct ShareFileInfo: Sendable, Equatable {
+        public let filename: String
+        public let size: UInt64
+        public let bitrate: UInt32?
+        public let duration: UInt32?
+        public let isPrivate: Bool
+    }
+
+    public struct SharesReplyInfo: Sendable, Equatable {
+        public let files: [ShareFileInfo]
+    }
+
+    /// Parse decompressed SharesReply payload (code 5).
+    /// The caller must decompress the zlib data before calling this.
+    public nonisolated static func parseSharesReply(_ decompressed: Data) -> SharesReplyInfo? {
+        var offset = 0
+        var files: [ShareFileInfo] = []
+
+        guard let dirCount = decompressed.readUInt32(at: offset) else { return nil }
+        guard plausibleItemCount(dirCount, at: offset + 4, in: decompressed) else { return nil }
+        offset += 4
+
+        for _ in 0..<dirCount {
+            guard let (dirName, dirLen) = decompressed.readString(at: offset) else { return nil }
+            offset += dirLen
+
+            guard let fileCount = decompressed.readUInt32(at: offset) else { return nil }
+            guard plausibleItemCount(fileCount, at: offset + 4, in: decompressed) else { return nil }
+            offset += 4
+
+            for _ in 0..<fileCount {
+                guard let file = readShareFileEntry(decompressed, offset: &offset, dirName: dirName, isPrivate: false) else { return nil }
+                files.append(file)
+            }
+        }
+
+        // Skip "unknown" uint32
+        if offset + 4 <= decompressed.count {
+            offset += 4
+        }
+
+        // Parse private directories. Lenient (this tail is optional), but a
+        // malformed entry stops the WHOLE section — the offset is misaligned
+        // past that point, so continuing the outer loop would decode garbage.
+        if let privateDirCount = decompressed.readUInt32(at: offset),
+           privateDirCount > 0, plausibleItemCount(privateDirCount, at: offset + 4, in: decompressed) {
+            offset += 4
+
+            privateSection: for _ in 0..<privateDirCount {
+                guard let (dirName, dirLen) = decompressed.readString(at: offset) else { break privateSection }
+                offset += dirLen
+
+                guard let fileCount = decompressed.readUInt32(at: offset),
+                      plausibleItemCount(fileCount, at: offset + 4, in: decompressed) else { break privateSection }
+                offset += 4
+
+                for _ in 0..<fileCount {
+                    guard let file = readShareFileEntry(decompressed, offset: &offset, dirName: dirName, isPrivate: true) else { break privateSection }
+                    files.append(file)
+                }
+            }
+        }
+
+        return SharesReplyInfo(files: files)
+    }
+
+    public struct FolderContentsReplyInfo: Sendable, Equatable {
+        public let token: UInt32
+        public let folder: String
+        public let files: [ShareFileInfo]
+    }
+
+    /// Parse decompressed FolderContentsReply payload (code 37).
+    public nonisolated static func parseFolderContentsReply(_ decompressed: Data) -> FolderContentsReplyInfo? {
+        var offset = 0
+
+        guard let token = decompressed.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let (folder, folderLen) = decompressed.readString(at: offset) else { return nil }
+        offset += folderLen
+
+        guard let folderCount = decompressed.readUInt32(at: offset) else { return nil }
+        guard plausibleItemCount(folderCount, at: offset + 4, in: decompressed) else { return nil }
+        offset += 4
+
+        var files: [ShareFileInfo] = []
+
+        // A malformed entry stops the whole scan (misaligned offset), keeping
+        // whatever parsed cleanly before it.
+        folderScan: for _ in 0..<folderCount {
+            guard let (_, dirLen) = decompressed.readString(at: offset) else { break folderScan }
+            offset += dirLen
+
+            guard let fileCount = decompressed.readUInt32(at: offset),
+                  plausibleItemCount(fileCount, at: offset + 4, in: decompressed) else { break folderScan }
+            offset += 4
+
+            for _ in 0..<fileCount {
+                guard let file = readShareFileEntry(decompressed, offset: &offset, dirName: nil, isPrivate: false) else { break folderScan }
+                files.append(file)
+            }
+        }
+
+        return FolderContentsReplyInfo(token: token, folder: folder, files: files)
+    }
+
+    public struct UserInfoReplyInfo: Sendable, Equatable {
+        public let description: String
+        public let hasPicture: Bool
+        // var: the cache layer strips pictures from unsolicited replies.
+        public var pictureData: Data?
+        public let totalUploads: UInt32
+        public let queueSize: UInt32
+        public let hasFreeSlots: Bool
+    }
+
+    /// Parse UserInfoReply payload (code 16).
+    public nonisolated static func parseUserInfoReply(_ payload: Data) -> UserInfoReplyInfo? {
+        var offset = 0
+
+        guard let (description, descLen) = payload.readString(at: offset) else { return nil }
+        offset += descLen
+
+        guard let hasPicture = payload.readBool(at: offset) else { return nil }
+        offset += 1
+
+        var pictureData: Data?
+        if hasPicture {
+            guard let pictureLen = payload.readUInt32(at: offset) else { return nil }
+            offset += 4
+            guard offset + Int(pictureLen) <= payload.count else { return nil }
+            pictureData = payload.safeSubdata(in: offset..<(offset + Int(pictureLen)))
+            offset += Int(pictureLen)
+        }
+
+        guard let totalUploads = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let queueSize = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let hasFreeSlots = payload.readBool(at: offset) else { return nil }
+
+        return UserInfoReplyInfo(
+            description: description,
+            hasPicture: hasPicture,
+            pictureData: pictureData,
+            totalUploads: totalUploads,
+            queueSize: queueSize,
+            hasFreeSlots: hasFreeSlots
+        )
+    }
+
+    public struct TransferReplyInfo: Sendable, Equatable {
+        public let token: UInt32
+        public let allowed: Bool
+        public let fileSize: UInt64?
+        public let reason: String?
+    }
+
+    /// Parse TransferReply payload (code 41).
+    public nonisolated static func parseTransferReply(_ payload: Data) -> TransferReplyInfo? {
+        var offset = 0
+
+        guard let token = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let allowed = payload.readBool(at: offset) else { return nil }
+        offset += 1
+
+        var fileSize: UInt64?
+        var reason: String?
+
+        if allowed {
+            // Two legal shapes: 41a (accept with uint64 filesize) and 41b
+            // (bare accept, nothing after the bool). Distinguish a genuine
+            // 41b (0 trailing bytes) from a truncated 41a (1-7 trailing
+            // bytes) — the latter is corrupt and must not parse as an
+            // accept with unknown size.
+            let remaining = payload.count - offset
+            if remaining >= 8 {
+                fileSize = payload.readUInt64(at: offset)
+            } else if remaining > 0 {
+                return nil
+            }
+        } else {
+            reason = payload.readString(at: offset)?.string
+        }
+
+        return TransferReplyInfo(token: token, allowed: allowed, fileSize: fileSize, reason: reason)
+    }
+
+    // MARK: - Server Message Parsing (Extended)
+
+    public struct JoinRoomInfo: Sendable, Equatable {
+        public let roomName: String
+        public let users: [String]
+        public let owner: String?
+        public let operators: [String]
+    }
+
+    /// Parse JoinRoom payload (code 14).
+    public nonisolated static func parseJoinRoom(_ payload: Data) -> JoinRoomInfo? {
+        var offset = 0
+
+        guard let (roomName, roomLen) = payload.readString(at: offset) else { return nil }
+        offset += roomLen
+
+        guard let userCount = payload.readUInt32(at: offset) else { return nil }
+        guard userCount <= maxItemCount else { return nil }
+        offset += 4
+
+        var users: [String] = []
+        for _ in 0..<userCount {
+            // A malformed entry makes every later offset garbage (the status/
+            // stats skips below would misread counts) — reject the payload.
+            guard let (username, usernameLen) = payload.readString(at: offset) else { return nil }
+            users.append(username)
+            offset += usernameLen
+        }
+
+        // Skip statuses (uint32 count + uint32 per user)
+        if let statusCount = payload.readUInt32(at: offset) {
+            guard statusCount <= maxItemCount else { return nil }
+            offset += 4
+            let bytesToSkip = Int(statusCount) * 4
+            guard offset + bytesToSkip <= payload.count else { return nil }
+            offset += bytesToSkip
+        }
+
+        // Skip user stats (uint32 count + 20 bytes per user)
+        if let statsCount = payload.readUInt32(at: offset) {
+            guard statsCount <= maxItemCount else { return nil }
+            offset += 4
+            let bytesToSkip = Int(statsCount) * 20
+            guard offset + bytesToSkip <= payload.count else { return nil }
+            offset += bytesToSkip
+        }
+
+        // Skip slotsfull (uint32 count + uint32 per user)
+        if let slotsCount = payload.readUInt32(at: offset) {
+            guard slotsCount <= maxItemCount else { return nil }
+            offset += 4
+            let bytesToSkip = Int(slotsCount) * 4
+            guard offset + bytesToSkip <= payload.count else { return nil }
+            offset += bytesToSkip
+        }
+
+        // Skip countries (uint32 count + string per user)
+        if let countryCount = payload.readUInt32(at: offset) {
+            guard countryCount <= maxItemCount else { return nil }
+            offset += 4
+            for _ in 0..<countryCount {
+                guard let (_, countryLen) = payload.readString(at: offset) else { break }
+                offset += countryLen
+            }
+        }
+
+        // Private room data (optional)
+        var owner: String?
+        var operators: [String] = []
+
+        if offset < payload.count {
+            if let (ownerName, ownerLen) = payload.readString(at: offset) {
+                owner = ownerName.isEmpty ? nil : ownerName
+                offset += ownerLen
+
+                if let opCount = payload.readUInt32(at: offset) {
+                    guard opCount <= maxItemCount else { return nil }
+                    offset += 4
+                    for _ in 0..<opCount {
+                        guard let (opName, opLen) = payload.readString(at: offset) else { break }
+                        operators.append(opName)
+                        offset += opLen
+                    }
+                }
+            }
+        }
+
+        return JoinRoomInfo(roomName: roomName, users: users, owner: owner, operators: operators)
+    }
+
+    public struct WatchUserInfo: Sendable, Equatable {
+        public let username: String
+        public let exists: Bool
+        public let status: UserStatus?
+        public let avgSpeed: UInt32?
+        public let uploadNum: UInt32?
+        public let files: UInt32?
+        public let dirs: UInt32?
+        /// Present for online / away users (per spec); nil for offline or not-exists.
+        public let countryCode: String?
+    }
+
+    /// Parse WatchUser response payload (code 5 response).
+    public nonisolated static func parseWatchUser(_ payload: Data) -> WatchUserInfo? {
+        var offset = 0
+
+        guard let (username, usernameLen) = payload.readString(at: offset) else { return nil }
+        offset += usernameLen
+
+        guard let exists = payload.readBool(at: offset) else { return nil }
+        offset += 1
+
+        guard exists else {
+            return WatchUserInfo(
+                username: username, exists: false,
+                status: nil, avgSpeed: nil, uploadNum: nil, files: nil, dirs: nil,
+                countryCode: nil
+            )
+        }
+
+        guard let statusRaw = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+        guard let avgSpeed = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+        guard let uploadNum = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+        // Skip unknown uint32
+        guard payload.readUInt32(at: offset) != nil else { return nil }
+        offset += 4
+        guard let files = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+        guard let dirs = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        let status = UserStatus(rawValue: statusRaw) ?? .offline
+
+        // Spec: country code string trails when status is online or away.
+        var countryCode: String?
+        if status == .away || status == .online,
+           let (code, _) = payload.readString(at: offset) {
+            countryCode = code.isEmpty ? nil : code
+        }
+
+        return WatchUserInfo(
+            username: username, exists: true,
+            status: status, avgSpeed: avgSpeed, uploadNum: uploadNum,
+            files: files, dirs: dirs,
+            countryCode: countryCode
+        )
+    }
+
+    public struct PossibleParentInfo: Sendable, Equatable {
+        public let username: String
+        public let ip: String
+        public let port: UInt32
+    }
+
+    /// Parse PossibleParents payload (code 102).
+    public nonisolated static func parsePossibleParents(_ payload: Data) -> [PossibleParentInfo]? {
+        var offset = 0
+
+        guard let parentCount = payload.readUInt32(at: offset) else { return nil }
+        guard parentCount <= maxItemCount else { return nil }
+        offset += 4
+
+        var parents: [PossibleParentInfo] = []
+        for _ in 0..<parentCount {
+            guard let (username, usernameLen) = payload.readString(at: offset) else { break }
+            offset += usernameLen
+
+            guard let ip = payload.readUInt32(at: offset) else { break }
+            offset += 4
+
+            guard let port = payload.readUInt32(at: offset) else { break }
+            offset += 4
+
+            let ipString = formatLittleEndianIPv4(ip)
+            parents.append(PossibleParentInfo(username: username, ip: ipString, port: port))
+        }
+
+        return parents
+    }
+
+    public struct RecommendationEntry: Sendable, Equatable {
+        public let item: String
+        public let score: Int32
+    }
+
+    public struct RecommendationsInfo: Sendable, Equatable {
+        public let recommendations: [RecommendationEntry]
+        public let unrecommendations: [RecommendationEntry]
+    }
+
+    /// Parse Recommendations payload (code 54, 55, 56).
+    public nonisolated static func parseRecommendations(_ payload: Data) -> RecommendationsInfo? {
+        var offset = 0
+
+        guard let recCount = payload.readUInt32(at: offset) else { return nil }
+        guard recCount <= maxItemCount else { return nil }
+        offset += 4
+
+        var recommendations: [RecommendationEntry] = []
+        for _ in 0..<recCount {
+            guard let (item, itemLen) = payload.readString(at: offset) else { break }
+            offset += itemLen
+            guard let score = payload.readInt32(at: offset) else { break }
+            offset += 4
+            recommendations.append(RecommendationEntry(item: item, score: score))
+        }
+
+        guard let unrecCount = payload.readUInt32(at: offset) else {
+            // Return what we have if unrecommendations section is missing
+            return RecommendationsInfo(recommendations: recommendations, unrecommendations: [])
+        }
+        guard unrecCount <= maxItemCount else { return nil }
+        offset += 4
+
+        var unrecommendations: [RecommendationEntry] = []
+        for _ in 0..<unrecCount {
+            guard let (item, itemLen) = payload.readString(at: offset) else { break }
+            offset += itemLen
+            guard let score = payload.readInt32(at: offset) else { break }
+            offset += 4
+            unrecommendations.append(RecommendationEntry(item: item, score: score))
+        }
+
+        return RecommendationsInfo(recommendations: recommendations, unrecommendations: unrecommendations)
+    }
+
+    public struct UserInterestsInfo: Sendable, Equatable {
+        public let username: String
+        public let likes: [String]
+        public let hates: [String]
+    }
+
+    /// Parse UserInterests payload (code 57).
+    public nonisolated static func parseUserInterests(_ payload: Data) -> UserInterestsInfo? {
+        var offset = 0
+
+        guard let (username, usernameLen) = payload.readString(at: offset) else { return nil }
+        offset += usernameLen
+
+        guard let likedCount = payload.readUInt32(at: offset) else { return nil }
+        guard likedCount <= maxItemCount else { return nil }
+        offset += 4
+
+        var likes: [String] = []
+        for _ in 0..<likedCount {
+            guard let (interest, interestLen) = payload.readString(at: offset) else { break }
+            likes.append(interest)
+            offset += interestLen
+        }
+
+        guard let hatedCount = payload.readUInt32(at: offset) else { return nil }
+        guard hatedCount <= maxItemCount else { return nil }
+        offset += 4
+
+        var hates: [String] = []
+        for _ in 0..<hatedCount {
+            guard let (interest, interestLen) = payload.readString(at: offset) else { break }
+            hates.append(interest)
+            offset += interestLen
+        }
+
+        return UserInterestsInfo(username: username, likes: likes, hates: hates)
+    }
+
+    public struct SimilarUserEntry: Sendable, Equatable {
+        public let username: String
+        public let rating: UInt32
+    }
+
+    /// Parse SimilarUsers payload (code 110).
+    public nonisolated static func parseSimilarUsers(_ payload: Data) -> [SimilarUserEntry]? {
+        var offset = 0
+
+        guard let userCount = payload.readUInt32(at: offset) else { return nil }
+        guard userCount <= maxItemCount else { return nil }
+        offset += 4
+
+        var users: [SimilarUserEntry] = []
+        for _ in 0..<userCount {
+            guard let (username, usernameLen) = payload.readString(at: offset) else { break }
+            offset += usernameLen
+            guard let rating = payload.readUInt32(at: offset) else { break }
+            offset += 4
+            users.append(SimilarUserEntry(username: username, rating: rating))
+        }
+
+        return users
+    }
+
+    public struct UserStatsInfo: Sendable, Equatable {
+        public let username: String
+        public let avgSpeed: UInt32
+        public let uploadNum: UInt32
+        public let files: UInt32
+        public let dirs: UInt32
+    }
+
+    /// Parse GetUserStats payload (code 36 response).
+    public nonisolated static func parseGetUserStats(_ payload: Data) -> UserStatsInfo? {
+        var offset = 0
+
+        guard let (username, usernameLen) = payload.readString(at: offset) else { return nil }
+        offset += usernameLen
+
+        guard let avgSpeed = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let uploadNum = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        // Skip unknown uint32
+        guard payload.readUInt32(at: offset) != nil else { return nil }
+        offset += 4
+
+        guard let files = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let dirs = payload.readUInt32(at: offset) else { return nil }
+
+        return UserStatsInfo(username: username, avgSpeed: avgSpeed, uploadNum: uploadNum, files: files, dirs: dirs)
+    }
+
+    public struct RoomTickerEntry: Sendable, Equatable {
+        public let username: String
+        public let ticker: String
+    }
+
+    public struct RoomTickerStateInfo: Sendable, Equatable {
+        public let room: String
+        public let tickers: [RoomTickerEntry]
+    }
+
+    /// Parse RoomTickerState payload (code 113).
+    public nonisolated static func parseRoomTickerState(_ payload: Data) -> RoomTickerStateInfo? {
+        var offset = 0
+
+        guard let (room, roomLen) = payload.readString(at: offset) else { return nil }
+        offset += roomLen
+
+        guard let tickerCount = payload.readUInt32(at: offset) else { return nil }
+        guard tickerCount <= maxItemCount else { return nil }
+        offset += 4
+
+        var tickers: [RoomTickerEntry] = []
+        for _ in 0..<tickerCount {
+            guard let (username, usernameLen) = payload.readString(at: offset) else { break }
+            offset += usernameLen
+            guard let (ticker, tickerLen) = payload.readString(at: offset) else { break }
+            offset += tickerLen
+            tickers.append(RoomTickerEntry(username: username, ticker: ticker))
+        }
+
+        return RoomTickerStateInfo(room: room, tickers: tickers)
+    }
+
+    public struct RoomMembersInfo: Sendable, Equatable {
+        public let room: String
+        public let members: [String]
+    }
+
+    /// Parse PrivateRoomMembers / PrivateRoomOperators payload (codes 133, 148).
+    public nonisolated static func parseRoomMembers(_ payload: Data) -> RoomMembersInfo? {
+        var offset = 0
+
+        guard let (room, roomLen) = payload.readString(at: offset) else { return nil }
+        offset += roomLen
+
+        guard let memberCount = payload.readUInt32(at: offset) else { return nil }
+        guard memberCount <= maxItemCount else { return nil }
+        offset += 4
+
+        var members: [String] = []
+        for _ in 0..<memberCount {
+            guard let (username, usernameLen) = payload.readString(at: offset) else { break }
+            members.append(username)
+            offset += usernameLen
+        }
+
+        return RoomMembersInfo(room: room, members: members)
+    }
+
+    /// Parse ExcludedSearchPhrases payload (code 160).
+    public nonisolated static func parseExcludedSearchPhrases(_ payload: Data) -> [String]? {
+        var offset = 0
+
+        guard let count = payload.readUInt32(at: offset) else { return nil }
+        guard count <= maxItemCount else { return nil }
+        offset += 4
+
+        var phrases: [String] = []
+        for _ in 0..<count {
+            guard let (phrase, phraseLen) = payload.readString(at: offset) else { break }
+            phrases.append(phrase)
+            offset += phraseLen
+        }
+
+        return phrases
+    }
+
+    public struct DistributedSearchInfo: Sendable, Equatable {
+        public let unknown: UInt32
+        public let username: String
+        public let token: UInt32
+        public let query: String
+    }
+
+    /// Parse distributed search request payload (distributed code 3).
+    public nonisolated static func parseDistributedSearch(_ payload: Data) -> DistributedSearchInfo? {
+        var offset = 0
+
+        guard let unknown = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let (username, usernameLen) = payload.readString(at: offset) else { return nil }
+        offset += usernameLen
+
+        guard let token = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        guard let (query, _) = payload.readString(at: offset) else { return nil }
+
+        return DistributedSearchInfo(unknown: unknown, username: username, token: token, query: query)
+    }
+
+    /// Entries are 12 bytes minimum (code + empty-string length prefix +
+    /// reserved), so a count above `remaining / 12` is provably a lie. The
+    /// cap is a second belt: `readUInt32`/`readString` bounds-check every
+    /// field, so an oversized count fails on the first read anyway.
+    private static let maxAdvertisedCapabilities = 64
+
+    public nonisolated static func parseExtendedClientInfo(_ payload: Data) -> ExtendedClientInfo? {
+        var offset = 0
+
+        guard let revision = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+
+        // Fail closed on an unknown revision rather than guessing at the layout.
+        guard revision == ExtendedClientInfo.currentRevision else { return nil }
+
+        guard let (clientInfo, infoBytes) = payload.readString(at: offset) else { return nil }
+        offset += infoBytes
+
+        guard let count = payload.readUInt32(at: offset) else { return nil }
+        offset += 4
+        guard count <= maxAdvertisedCapabilities else { return nil }
+
+        var capabilities: [String: UInt32] = [:]
+        for _ in 0..<count {
+            guard let code = payload.readUInt32(at: offset) else { return nil }
+            offset += 4
+            guard let (name, nameBytes) = payload.readString(at: offset) else { return nil }
+            offset += nameBytes
+            guard payload.readUInt32(at: offset) != nil else { return nil }  // reserved
+            offset += 4
+            capabilities[name] = code
+        }
+
+        return ExtendedClientInfo(revision: revision, clientInfo: clientInfo, capabilities: capabilities)
+    }
+}

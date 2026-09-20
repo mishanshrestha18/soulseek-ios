@@ -1,0 +1,419 @@
+import Foundation
+import Network
+import os
+import Synchronization
+
+public actor ServerConnection {
+    // MARK: - Types
+
+    public enum State: Sendable {
+        case disconnected
+        case connecting
+        case connected
+        case failed(Error)
+    }
+
+    public enum ConnectionError: Error, LocalizedError {
+        case notConnected
+        case alreadyConnecting
+        case connectionFailed(String)
+        case loginFailed(String)
+        case timeout
+        case invalidResponse
+
+        public var errorDescription: String? {
+            switch self {
+            case .notConnected: "Not connected to server"
+            case .alreadyConnecting: "A connection attempt is already in progress"
+            case .connectionFailed(let reason): "Connection failed: \(reason)"
+            case .loginFailed(let reason): "Login failed: \(reason)"
+            case .timeout: "Connection timed out"
+            case .invalidResponse: "Invalid server response"
+            }
+        }
+    }
+
+    // MARK: - Properties
+
+    private let host: String
+    private let port: UInt16
+    private var connection: NWConnection?
+    private var receiveBuffer = Data()
+
+    private(set) var state: State = .disconnected
+
+    // Connection continuation - stored as property to ensure single-resume safety
+    private var connectContinuation: CheckedContinuation<Void, Error>?
+
+    // Bounds the connect attempt: NWConnection can sit in `.waiting`
+    // indefinitely (e.g. connection refused keeps retrying on path
+    // changes and never reaches `.failed`), which would otherwise hang
+    // the caller forever and leave `state` stuck at `.connecting`.
+    private var connectTimeoutTask: Task<Void, Never>?
+    private static let connectTimeoutSeconds: Int = 15
+
+    // Async stream for messages
+    private var messageContinuation: AsyncStream<Data>.Continuation?
+    // Frames parsed before a consumer registers (the stream's continuation
+    // is handed over via an actor hop, so there's a window after `.ready`
+    // where messages would otherwise be dropped). Flushed on registration.
+    private var pendingMessages: [Data] = []
+    private static let maxPendingMessages = 2048
+    /// True once we've warned about dropping frames in the current
+    /// no-consumer overflow episode, so the log fires once, not per frame.
+    private var pendingOverflowLogged = false
+    private var streamGeneration = 0
+
+    private let logger = Logger(subsystem: "com.seeleseek", category: "ServerConnection")
+
+    // MARK: - Configuration
+
+    public static let defaultHost = "server.slsknet.org"
+    public static let defaultPort: UInt16 = 2242
+
+    // MARK: - Initialization
+
+    public init(host: String = defaultHost, port: UInt16 = defaultPort) {
+        self.host = host
+        self.port = port
+    }
+
+    // MARK: - Async Message Stream
+
+    /// Stream minted for the current session; repeated `messages` accesses
+    /// return it instead of finishing the active consumer's stream.
+    private nonisolated let cachedMessageStream = Mutex<AsyncStream<Data>?>(nil)
+
+    /// Async stream of complete message frames from the server.
+    ///
+    /// Single-consumer: only one `for await` loop may iterate it at a time.
+    /// Accesses within one session return the same cached stream (so an
+    /// accidental second access can't finish the active consumer's stream);
+    /// `disconnect()` finishes it and clears the cache so the next session
+    /// mints a fresh one.
+    public nonisolated var messages: AsyncStream<Data> {
+        cachedMessageStream.withLock { cached in
+            if let cached { return cached }
+            let stream = AsyncStream<Data> { continuation in
+                Task {
+                    await self.setMessageContinuation(continuation)
+                }
+            }
+            cached = stream
+            return stream
+        }
+    }
+
+    private func setMessageContinuation(_ continuation: AsyncStream<Data>.Continuation) {
+        // A second consumer replaces the first; finish the old stream so its
+        // `for await` loop exits instead of silently going quiet.
+        messageContinuation?.finish()
+        streamGeneration += 1
+        let generation = streamGeneration
+        messageContinuation = continuation
+        continuation.onTermination = { @Sendable _ in
+            Task { await self.clearContinuation(ifGeneration: generation) }
+        }
+        // Flush frames that arrived before the consumer registered.
+        for frame in pendingMessages {
+            continuation.yield(frame)
+        }
+        pendingMessages.removeAll()
+        pendingOverflowLogged = false
+    }
+
+    private func clearContinuation(ifGeneration generation: Int) {
+        // A stale stream's termination must not tear down a newer stream.
+        guard generation == streamGeneration else { return }
+        messageContinuation = nil
+    }
+
+    // MARK: - Public Interface
+
+    public func connect() async throws {
+        guard case .disconnected = state else {
+            // Silently returning here made a concurrent connect() look
+            // successful while the first attempt was still in flight —
+            // surface it so the caller can decide how to handle it.
+            logger.warning("connect() called while already connected or connecting")
+            throw ConnectionError.alreadyConnecting
+        }
+
+        updateState(.connecting)
+
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        // Enable TCP keepalive to detect silent connection deaths quickly
+        // Without this, a dead connection (NAT timeout, ISP reset) can go undetected for hours
+        if let tcpOptions = parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
+            tcpOptions.noDelay = true
+            tcpOptions.enableKeepalive = true
+            tcpOptions.keepaliveInterval = 60  // probe every 60s after idle
+            tcpOptions.keepaliveCount = 3      // give up after 3 missed probes
+            tcpOptions.keepaliveIdle = 120     // start probing after 2 min idle
+        }
+
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            updateState(.disconnected)
+            throw ConnectionError.connectionFailed("Invalid port: \(port)")
+        }
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host(host),
+            port: nwPort
+        )
+
+        let conn = NWConnection(to: endpoint, using: parameters)
+        connection = conn
+        connectGeneration += 1
+        let generation = connectGeneration
+
+        return try await withCheckedThrowingContinuation { continuation in
+            self.connectContinuation = continuation
+            self.connectTimeoutTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(Self.connectTimeoutSeconds))
+                guard !Task.isCancelled else { return }
+                await self?.handleConnectTimeout()
+            }
+            conn.stateUpdateHandler = { [weak self] newState in
+                guard let self else { return }
+                Task {
+                    await self.handleStateChange(newState, generation: generation)
+                }
+            }
+            conn.start(queue: .global(qos: .userInitiated))
+        }
+    }
+
+    /// Resume the pending connect continuation exactly once and stop the
+    /// connect timeout. Safe to call from any path; no-ops when nothing
+    /// is pending.
+    private func resumeConnectContinuation(throwing error: Error?) {
+        connectTimeoutTask?.cancel()
+        connectTimeoutTask = nil
+        guard let continuation = connectContinuation else { return }
+        connectContinuation = nil
+        if let error {
+            continuation.resume(throwing: error)
+        } else {
+            continuation.resume()
+        }
+    }
+
+    private func handleConnectTimeout() {
+        guard connectContinuation != nil else { return }
+        logger.error("Connect to \(self.host):\(self.port) timed out after \(Self.connectTimeoutSeconds)s")
+        resumeConnectContinuation(throwing: ConnectionError.timeout)
+        // Tear down so state returns to .disconnected and a future
+        // connect() isn't no-op'd by the .connecting guard.
+        disconnect()
+    }
+
+    public func disconnect() {
+        connection?.cancel()
+        connection = nil
+        receiveBuffer = Data()
+        // Resume any pending connect continuation before state change
+        resumeConnectContinuation(throwing: ConnectionError.notConnected)
+        // Finish the async message stream so NetworkClient's `for await` loop exits
+        messageContinuation?.finish()
+        messageContinuation = nil
+        pendingMessages.removeAll()
+        pendingOverflowLogged = false
+        // Next session's `messages` access must mint a fresh stream.
+        cachedMessageStream.withLock { $0 = nil }
+        updateState(.disconnected)
+    }
+
+    public func send(_ data: Data) async throws {
+        guard let connection, case .connected = state else {
+            throw ConnectionError.notConnected
+        }
+
+        logger.debug("Sending \(data.count) bytes")
+
+        // Under TCP backpressure `contentProcessed` may not fire for minutes;
+        // cancelling the socket forces it to fire (with an error) so a
+        // cancelled caller resolves instead of sitting wedged. The callback
+        // fires exactly once either way, so single-resume holds.
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                connection.send(content: data, completion: .contentProcessed { [weak self] error in
+                    if let error {
+                        self?.logger.error("Send failed: \(error.localizedDescription)")
+                        continuation.resume(throwing: error)
+                    } else {
+                        self?.logger.debug("Send completed")
+                        continuation.resume()
+                    }
+                })
+            }
+        } onCancel: {
+            connection.cancel()
+        }
+    }
+
+    // MARK: - Private Methods
+
+    // Bumped per connect(); a cancelled previous socket's late events must
+    // not fail or tear down the current attempt during quick reconnects.
+    private var connectGeneration = 0
+
+    private func handleStateChange(_ newState: NWConnection.State, generation: Int) {
+        guard generation == connectGeneration else {
+            logger.debug("Ignoring stale connection state from a previous attempt: \(String(describing: newState))")
+            return
+        }
+        switch newState {
+        case .ready:
+            logger.info("Connected to \(self.host):\(self.port)")
+            updateState(.connected)
+            resumeConnectContinuation(throwing: nil)
+            Task { await startReceiving() }
+
+        case .failed(let error):
+            logger.error("Connection failed: \(error.localizedDescription)")
+            resumeConnectContinuation(throwing: ConnectionError.connectionFailed(error.localizedDescription))
+            // Clean up and end the async stream so NetworkClient detects the loss
+            disconnect()
+
+        case .cancelled:
+            logger.info("Connection cancelled")
+            updateState(.disconnected)
+            // If cancelled during connect, resume with error
+            resumeConnectContinuation(throwing: ConnectionError.connectionFailed("Connection cancelled"))
+
+        case .waiting(let error):
+            logger.warning("Connection waiting: \(error.localizedDescription)")
+            // TCP-level refusals/unreachability park NWConnection in .waiting
+            // (it retries on path changes and never reaches .failed). Treat
+            // the definitive POSIX codes as failures so connect() doesn't
+            // hang until the timeout: ENOMEM, ENETUNREACH, ENOTCONN,
+            // ETIMEDOUT, ECONNREFUSED, EHOSTUNREACH.
+            if case .posix(let posixError) = error {
+                let code = posixError.rawValue
+                if code == 12 || code == 51 || code == 57 || code == 60 || code == 61 || code == 65 {
+                    logger.error("Server connection definitive failure: POSIX \(code)")
+                    resumeConnectContinuation(throwing: ConnectionError.connectionFailed(error.localizedDescription))
+                    disconnect()
+                }
+            }
+
+        default:
+            break
+        }
+    }
+
+    private func startReceiving() async {
+        guard let connection else { return }
+        let generation = connectGeneration
+
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 262144) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+
+            Task {
+                await self.handleReceiveCallback(
+                    data: data,
+                    isComplete: isComplete,
+                    error: error,
+                    generation: generation,
+                    armedConnection: connection
+                )
+            }
+        }
+    }
+
+    private func handleReceiveCallback(
+        data: Data?,
+        isComplete: Bool,
+        error: Error?,
+        generation: Int,
+        armedConnection: NWConnection
+    ) async {
+        // A stale callback from a cancelled socket must not append its bytes
+        // to the new connection's buffer, tear the new connection down, or
+        // rearm a receive on the dead socket during quick reconnects.
+        guard generation == connectGeneration, armedConnection === connection else {
+            logger.debug("Ignoring receive callback from a previous connection")
+            return
+        }
+
+        if let data {
+            await handleReceivedData(data)
+        }
+
+        // handleReceivedData can disconnect (buffer overflow); re-check
+        // before disconnecting again or rearming.
+        guard generation == connectGeneration, armedConnection === connection else { return }
+
+        if isComplete || error != nil {
+            disconnect()
+        } else {
+            await startReceiving()
+        }
+    }
+
+    // MARK: - Security Constants
+    /// Maximum receive buffer size to prevent memory exhaustion
+    /// Server messages are typically small, but room lists can be large
+    private static let maxReceiveBufferSize = 50 * 1024 * 1024  // 50MB
+
+    private func handleReceivedData(_ data: Data) async {
+        receiveBuffer.append(data)
+        logger.debug("Received \(data.count) bytes, buffer now \(self.receiveBuffer.count) bytes")
+
+        // SECURITY: Check buffer size to prevent memory exhaustion
+        guard receiveBuffer.count <= Self.maxReceiveBufferSize else {
+            logger.error("Receive buffer exceeded limit, disconnecting")
+            receiveBuffer.removeAll()
+            disconnect()
+            return
+        }
+
+        // Process complete messages
+        while let (frame, consumed) = MessageParser.parseFrame(from: receiveBuffer) {
+            receiveBuffer.removeFirst(consumed)
+
+            // Per-frame trace — .debug to avoid duplicating the same
+            // firehose already emitted by ServerMessageHandler.
+            logger.debug("Parsed message: code=\(frame.code) payload=\(frame.payload.count) bytes")
+
+            // Build complete message with length prefix and code
+            var completeMessage = Data()
+            completeMessage.appendUInt32(UInt32(frame.payload.count + 4))
+            completeMessage.appendUInt32(frame.code)
+            completeMessage.append(frame.payload)
+
+            // Yield to async stream; if the consumer hasn't registered its
+            // continuation yet (actor hop in `messages`), buffer the frame
+            // so a fast login response isn't dropped.
+            if let messageContinuation {
+                messageContinuation.yield(completeMessage)
+            } else if pendingMessages.count < Self.maxPendingMessages {
+                pendingMessages.append(completeMessage)
+            } else if !pendingOverflowLogged {
+                // Once per overflow episode — the flag resets when a
+                // consumer registers or the connection tears down.
+                pendingOverflowLogged = true
+                logger.warning("pendingMessages exceeded \(Self.maxPendingMessages) frames with no consumer registered; dropping frames")
+            }
+        }
+    }
+
+    private func updateState(_ newState: State) {
+        state = newState
+    }
+}
+
+// MARK: - Convenience Extensions
+
+extension ServerConnection.State: Equatable {
+    public static func == (lhs: ServerConnection.State, rhs: ServerConnection.State) -> Bool {
+        switch (lhs, rhs) {
+        case (.disconnected, .disconnected): true
+        case (.connecting, .connecting): true
+        case (.connected, .connected): true
+        case (.failed, .failed): true
+        default: false
+        }
+    }
+}

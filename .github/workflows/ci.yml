@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'LICENSE*']
+  pull_request:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'LICENSE*']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # LiveServerTests reads this and disables itself; it hits the real
+  # Soulseek server, which throttles GitHub runner IPs.
+  CI: "true"
+
+jobs:
+  # Fast logic check. Runs the whole suite natively — no simulator boot.
+  host-test:
+    name: Test (host)
+    runs-on: macos-26
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: Packages/SeeleseekCore
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: swift --version && xcodebuild -version
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test
+
+  # The one that matters: proves SeeleseekCore actually compiles for iOS.
+  ios-build:
+    name: Build (iOS)
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: Packages/SeeleseekCore
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for iOS Simulator
+        run: xcodebuild build -scheme SeeleseekCore -destination 'generic/platform=iOS Simulator'
+      - name: Build for iOS device
+        run: xcodebuild build -scheme SeeleseekCore -destination 'generic/platform=iOS'
+
+  ios-test:
+    name: Test (iOS Simulator)
+    runs-on: macos-26
+    timeout-minutes: 40
+    needs: ios-build
+    steps:
+      - uses: actions/checkout@v4
+      # Device names churn between Xcode releases; resolve one at runtime
+      # instead of hardcoding a name that breaks on the next runner image.
+      - name: Resolve simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available --json | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next(x['udid'] for rt, ds in sorted(d.items()) if 'iOS' in rt for x in ds))")
+          echo "Using simulator $UDID"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+      - name: Test
+        working-directory: Packages/SeeleseekCore
+        run: xcodebuild test -scheme SeeleseekCore -destination "id=${{ steps.sim.outputs.udid }}" TEST_RUNNER_CI=true

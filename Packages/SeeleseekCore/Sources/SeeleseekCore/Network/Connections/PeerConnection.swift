@@ -1,0 +1,2016 @@
+import Foundation
+import Network
+import os
+import Synchronization
+
+/// Manages a single peer-to-peer connection
+public actor PeerConnection {
+    private nonisolated let logger = Logger(subsystem: "com.seeleseek", category: "PeerConnection")
+
+    // MARK: - Types
+
+    public enum State: Sendable, Equatable {
+        case disconnected
+        case connecting
+        case handshaking
+        case connected
+        case failed(Error)
+
+        public static func == (lhs: State, rhs: State) -> Bool {
+            switch (lhs, rhs) {
+            case (.disconnected, .disconnected): return true
+            case (.connecting, .connecting): return true
+            case (.handshaking, .handshaking): return true
+            case (.connected, .connected): return true
+            case (.failed, .failed): return true
+            default: return false
+            }
+        }
+    }
+
+    public enum ConnectionType: String, Sendable {
+        case peer = "P"      // General peer messages
+        case file = "F"      // File transfer
+        case distributed = "D" // Distributed network
+    }
+
+    public struct PeerInfo: Sendable {
+        public init(username: String, ip: String, port: Int, uploadSpeed: UInt32 = 0, downloadSpeed: UInt32 = 0, freeUploadSlots: Bool = true, queueLength: UInt32 = 0, sharedFiles: UInt32 = 0, sharedFolders: UInt32 = 0) { self.username = username; self.ip = ip; self.port = port; self.uploadSpeed = uploadSpeed; self.downloadSpeed = downloadSpeed; self.freeUploadSlots = freeUploadSlots; self.queueLength = queueLength; self.sharedFiles = sharedFiles; self.sharedFolders = sharedFolders }
+        public let username: String
+        public let ip: String
+        public let port: Int
+        public var uploadSpeed: UInt32 = 0
+        public var downloadSpeed: UInt32 = 0
+        public var freeUploadSlots: Bool = true
+        public var queueLength: UInt32 = 0
+        public var sharedFiles: UInt32 = 0
+        public var sharedFolders: UInt32 = 0
+    }
+
+    // MARK: - Properties
+
+    // peerInfo is protected by Mutex for thread-safe access from outside the actor
+    // (e.g., PeerConnectionPool, NetworkClient, DownloadManager read it without await)
+    private nonisolated let _peerInfo: Mutex<PeerInfo>
+    public nonisolated var peerInfo: PeerInfo {
+        _peerInfo.withLock { $0 }
+    }
+    public nonisolated let connectionType: ConnectionType
+    public nonisolated let isIncoming: Bool
+    public nonisolated let token: UInt32
+    /// Whether this connection uses the Soulseek "ROTATED" obfuscated wire format.
+    /// Set at construction; the receive and send paths branch on this.
+    public nonisolated let isObfuscated: Bool
+
+    private var connection: NWConnection?
+    private var receiveBuffer = Data()
+    /// Raw wire bytes still to be decoded, only populated when `isObfuscated` is true.
+    /// Decoded plain messages (length-prefixed) flow into `receiveBuffer` for the
+    /// existing framing parser to consume.
+    private var obfuscatedBuffer = Data()
+    private(set) var state: State = .disconnected
+
+    /// Check if the connection is currently connected and usable
+    public var isConnected: Bool {
+        guard connection != nil else { return false }
+        switch state {
+        case .connected, .handshaking:
+            return true
+        default:
+            return false
+        }
+    }
+
+    // For incoming connections, we delay starting the receive loop until callbacks are configured
+    private var autoStartReceiving = true
+
+    // AsyncStream for emitting events (replaces callbacks)
+    public nonisolated let events: AsyncStream<PeerConnectionEvent>
+    private let eventContinuation: AsyncStream<PeerConnectionEvent>.Continuation
+
+    // SeeleSeek extension state
+    private(set) var extendedClientInfo: ExtendedClientInfo?
+
+    /// The protocol allows exactly one advertisement per socket; re-sends
+    /// beyond this mark the peer misbehaving.
+    static let maxExtendedClientInfoResends = 3
+    private(set) var extendedClientInfoResends = 0
+
+    /// Sticky for the socket's lifetime; once set, `extendedClientInfo` stays
+    /// nil so `supports()` fails closed.
+    private(set) var extensionsMisbehaving = false
+
+    private var hasAdvertisedExtensions = false
+
+    /// Authoritative capability gate. Per-socket and always current, unlike
+    /// the pool's sticky per-username cache, which peers may invalidate at any
+    /// time by re-advertising a different set.
+    public func supports(_ code: ExtendedClientInfoCode) -> Bool {
+        extendedClientInfo?.supports(code) ?? false
+    }
+
+    /// Set the peer username (used when matching PierceFirewall to pending uploads)
+    public func setPeerUsername(_ username: String) {
+        peerUsername = username
+        // Also update peerInfo for consistency
+        _peerInfo.withLock { info in
+            info = PeerInfo(
+                username: username,
+                ip: info.ip,
+                port: info.port,
+                uploadSpeed: info.uploadSpeed,
+                downloadSpeed: info.downloadSpeed,
+                freeUploadSlots: info.freeUploadSlots,
+                queueLength: info.queueLength,
+                sharedFiles: info.sharedFiles,
+                sharedFolders: info.sharedFolders
+            )
+        }
+        logger.debug("[\(username)] Updated peer username")
+    }
+
+    /// Get the connection state (for debug logging from other actors)
+    public func getState() -> State {
+        return state
+    }
+
+    // Statistics
+    private(set) var bytesReceived: UInt64 = 0
+    private(set) var bytesSent: UInt64 = 0
+    private(set) var messagesReceived: UInt32 = 0
+    private(set) var messagesSent: UInt32 = 0
+    private(set) var connectedAt: Date?
+    // Mutex-backed so the pool's MainActor cleanup timer can read it
+    // synchronously while raw file bytes are flowing.
+    private nonisolated let _lastActivityAt = Mutex<Date?>(nil)
+    public nonisolated var lastActivityAt: Date? {
+        _lastActivityAt.withLock { $0 }
+    }
+    private nonisolated func touchLastActivity() {
+        _lastActivityAt.withLock { $0 = Date() }
+    }
+
+    // MARK: - Initialization
+
+    /// Local port to bind outgoing connections to (for NAT traversal)
+    private var localPort: UInt16 = 0
+
+    public init(peerInfo: PeerInfo, type: ConnectionType = .peer, token: UInt32 = 0, isIncoming: Bool = false, localPort: UInt16 = 0, isObfuscated: Bool = false, autoStartReceiving: Bool = true) {
+        let (stream, continuation) = AsyncStream.makeStream(of: PeerConnectionEvent.self)
+        self.events = stream
+        self.eventContinuation = continuation
+        self._peerInfo = Mutex(peerInfo)
+        self.connectionType = type
+        self.token = token
+        self.isIncoming = isIncoming
+        self.localPort = localPort
+        self.isObfuscated = isObfuscated
+        self.autoStartReceiving = autoStartReceiving
+    }
+
+    public init(connection: NWConnection, isIncoming: Bool = true, autoStartReceiving: Bool = true, isObfuscated: Bool = false) {
+        let (stream, continuation) = AsyncStream.makeStream(of: PeerConnectionEvent.self)
+        self.events = stream
+        self.eventContinuation = continuation
+
+        // For incoming connections, extract IP/port from the connection endpoint
+        // This fixes the issue where peerInfo.ip and peerInfo.port were empty for incoming connections
+        var extractedIP = ""
+        var extractedPort = 0
+
+        if let remoteEndpoint = connection.currentPath?.remoteEndpoint {
+            switch remoteEndpoint {
+            case .hostPort(let host, let port):
+                // Extract IP string from host
+                switch host {
+                case .ipv4(let ipv4):
+                    extractedIP = "\(ipv4)"
+                case .ipv6(let ipv6):
+                    extractedIP = "\(ipv6)"
+                case .name(let hostname, _):
+                    extractedIP = hostname
+                @unknown default:
+                    extractedIP = "\(host)"
+                }
+                extractedPort = Int(port.rawValue)
+                logger.debug("Incoming connection: extracted IP=\(extractedIP) port=\(extractedPort)")
+            default:
+                logger.debug("Incoming connection: could not extract IP/port from endpoint: \(String(describing: remoteEndpoint))")
+            }
+        } else {
+            // Path not available yet, try to extract from endpoint directly
+            // This can happen before the connection is started
+            logger.debug("Incoming connection: currentPath not available, IP/port unknown until connection starts")
+        }
+
+        self._peerInfo = Mutex(PeerInfo(username: "", ip: extractedIP, port: extractedPort))
+        self.connectionType = .peer
+        self.token = 0
+        self.isIncoming = isIncoming
+        self.isObfuscated = isObfuscated
+        self.connection = connection
+        self.autoStartReceiving = autoStartReceiving
+    }
+
+    // MARK: - Connection Management
+
+    // Track if connect continuation has been resumed to prevent double-resume
+    private var connectContinuationResumed = false
+    // Each dial/accept attempt gets a generation; state events from
+    // abandoned attempts (e.g. bind-retry's first socket) are dropped.
+    private var connectAttemptGeneration: UInt64 = 0
+    // Generation that reached .ready; gates event-stream finish on teardown.
+    private var connectionEstablishedGeneration: UInt64?
+
+    public func connect() async throws {
+        do {
+            try await dialWithBindRetry()
+        } catch {
+            // No usable connection: end the event stream so consumers exit.
+            eventContinuation.finish()
+            throw error
+        }
+    }
+
+    private func dialWithBindRetry() async throws {
+        guard case .disconnected = state else { return }
+
+        // Validate port range (must be valid UInt16 and non-zero)
+        guard peerInfo.port > 0, peerInfo.port <= Int(UInt16.max),
+              let nwPort = NWEndpoint.Port(rawValue: UInt16(peerInfo.port)) else {
+            logger.error("Invalid port: \(self.peerInfo.port)")
+            throw PeerError.invalidPort
+        }
+
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host(peerInfo.ip),
+            port: nwPort
+        )
+
+        // Bind outgoing to the listen port so peers see the same NAT mapping they
+        // reach us on. Fall back unbound if the OS refuses the bind.
+        let desiredLocalPort: UInt16? = localPort > 0 ? localPort : nil
+
+        do {
+            try await performConnect(to: endpoint, bindTo: desiredLocalPort)
+        } catch let error where Self.isBindFailure(error) {
+            guard desiredLocalPort != nil else { throw error }
+            logger.warning("Bound connect to \(self.peerInfo.ip):\(self.peerInfo.port) failed (\(error.localizedDescription)); retrying without local-port bind")
+            connection?.cancel()
+            connection = nil
+            updateState(.disconnected)
+            try await performConnect(to: endpoint, bindTo: nil)
+        }
+    }
+
+    /// Bounds the dial attempt: `.waiting` with a POSIX code outside the
+    /// definitive-failure list otherwise parks the continuation forever, and
+    /// `PeerConnectionPool.connect` is public with no wrapping timeout.
+    private static let connectTimeoutSeconds: Int = 15
+
+    private func performConnect(to endpoint: NWEndpoint, bindTo localPort: UInt16?) async throws {
+        updateState(.connecting)
+        connectContinuationResumed = false
+        connectAttemptGeneration += 1
+        let generation = connectAttemptGeneration
+
+        let params = Self.makeOutboundParameters(bindTo: localPort, remoteEndpoint: endpoint)
+        let conn = NWConnection(to: endpoint, using: params)
+        logger.debug("Creating TCP connection to \(self.peerInfo.ip):\(self.peerInfo.port) (localPort=\(localPort ?? 0))")
+        connection = conn
+
+        // Race the dial against an intrinsic timeout. On timeout, cancelling
+        // `conn` drives the state handler to `.cancelled`, which resumes the
+        // pending continuation (single-resume held by the
+        // `connectContinuationResumed` guard) so the dial child finishes.
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { continuation in
+                        conn.stateUpdateHandler = { [weak self] newState in
+                            guard let self else { return }
+                            Task {
+                                await self.handleConnectionState(newState, generation: generation, continuation: continuation)
+                            }
+                        }
+                        conn.start(queue: .global(qos: .userInitiated))
+                    }
+                } onCancel: {
+                    self.logger.debug("Task cancelled, stopping NWConnection to \(self.peerInfo.ip):\(self.peerInfo.port)...")
+                    conn.cancel()
+                }
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(Self.connectTimeoutSeconds))
+                throw PeerError.timeout
+            }
+            do {
+                _ = try await group.next()
+            } catch {
+                conn.cancel()
+                group.cancelAll()
+                throw error
+            }
+            group.cancelAll()
+        }
+    }
+
+    /// TCP parameters optionally bound to `localPort` for NAT port-reuse.
+    /// Local address family matches the remote endpoint.
+    public nonisolated static func makeOutboundParameters(
+        bindTo localPort: UInt16?,
+        remoteEndpoint: NWEndpoint
+    ) -> NWParameters {
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        if let tcpOptions = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
+            tcpOptions.noDelay = true
+        }
+        if let localPort, let nwLocalPort = NWEndpoint.Port(rawValue: localPort) {
+            let localHost: NWEndpoint.Host
+            if case .hostPort(let host, _) = remoteEndpoint, case .ipv6 = host {
+                localHost = .ipv6(.any)
+            } else {
+                localHost = .ipv4(.any)
+            }
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(host: localHost, port: nwLocalPort)
+        }
+        return params
+    }
+
+    /// True if the OS refused the local bind — caller should retry unbound.
+    public nonisolated static func isBindFailure(_ error: Error) -> Bool {
+        guard let nwError = error as? NWError else { return false }
+        if case .posix(let code) = nwError {
+            return code == .EADDRINUSE || code == .EADDRNOTAVAIL
+        }
+        return false
+    }
+
+    public func accept() async throws {
+        guard let connection, isIncoming else { return }
+
+        updateState(.connecting)
+        connectContinuationResumed = false
+        connectAttemptGeneration += 1
+        let generation = connectAttemptGeneration
+
+        return try await withCheckedThrowingContinuation { continuation in
+            connection.stateUpdateHandler = { [weak self] newState in
+                guard let self else { return }
+                Task {
+                    // When connection becomes ready, extract remote endpoint if not already done
+                    if case .ready = newState {
+                        await self.extractRemoteEndpointIfNeeded()
+                    }
+                    await self.handleConnectionState(newState, generation: generation, continuation: continuation)
+                }
+            }
+
+            connection.start(queue: .global(qos: .userInitiated))
+        }
+    }
+
+    /// Extract remote endpoint from connection if peerInfo IP is empty
+    /// Called when connection becomes ready to ensure we have the peer's IP/port
+    private func extractRemoteEndpointIfNeeded() {
+        guard peerInfo.ip.isEmpty, let connection else { return }
+
+        if let remoteEndpoint = connection.currentPath?.remoteEndpoint {
+            switch remoteEndpoint {
+            case .hostPort(let host, let port):
+                var extractedIP = ""
+                switch host {
+                case .ipv4(let ipv4):
+                    extractedIP = "\(ipv4)"
+                case .ipv6(let ipv6):
+                    extractedIP = "\(ipv6)"
+                case .name(let hostname, _):
+                    extractedIP = hostname
+                @unknown default:
+                    extractedIP = "\(host)"
+                }
+                let extractedPort = Int(port.rawValue)
+                logger.debug("Connection ready: extracted IP=\(extractedIP) port=\(extractedPort)")
+
+                // Update peerInfo with extracted IP/port
+                _peerInfo.withLock { info in
+                    info = PeerInfo(
+                        username: info.username,
+                        ip: extractedIP,
+                        port: extractedPort,
+                        uploadSpeed: info.uploadSpeed,
+                        downloadSpeed: info.downloadSpeed,
+                        freeUploadSlots: info.freeUploadSlots,
+                        queueLength: info.queueLength,
+                        sharedFiles: info.sharedFiles,
+                        sharedFolders: info.sharedFolders
+                    )
+                }
+                logger.debug("Updated peerInfo with IP=\(extractedIP) port=\(extractedPort)")
+            default:
+                logger.warning("Could not extract IP/port from endpoint type: \(String(describing: remoteEndpoint))")
+            }
+        }
+    }
+
+    public func disconnect() {
+        connection?.cancel()
+        connection = nil
+        updateState(.disconnected)
+        eventContinuation.finish()
+    }
+
+    /// Start the receive loop - call this after callbacks are configured for incoming connections
+    public func beginReceiving() {
+        guard connection != nil, !autoStartReceiving else { return }
+        logger.info("Beginning receive loop (callbacks configured)")
+        startReceiving()
+    }
+
+    // MARK: - Handshake
+
+    /// Send PeerInit message to identify ourselves
+    /// For direct P connections, token should be 0 per protocol
+    /// For indirect connections, use the token from ConnectToPeer
+    public func sendPeerInit(username: String, useZeroToken: Bool = true) async throws {
+        updateState(.handshaking)
+
+        // Per protocol: direct P connections use token=0
+        // Only indirect connections (responding to ConnectToPeer) use non-zero token
+        let peerInitToken: UInt32 = useZeroToken ? 0 : token
+
+        let message = MessageBuilder.peerInitMessage(
+            username: username,
+            connectionType: connectionType.rawValue,
+            token: peerInitToken
+        )
+
+        logger.debug("PeerInit: username='\(username)' type='\(self.connectionType.rawValue)' token=\(peerInitToken)")
+        try await send(message)
+
+        // Mark handshake as complete from our side after sending PeerInit
+        // We can now receive peer messages (code >= 4) without waiting for peer's response
+        handshakeComplete = true
+        logger.debug("PeerInit sent, handshake marked complete")
+
+        await advertiseExtensionsIfNeeded()
+    }
+
+    /// Single choke point for advertising our extension codes (code 10000),
+    /// fired from every moment a socket is affirmed P-type. Stored-type .peer
+    /// only: F sockets switch to raw transfer bytes after init and would
+    /// deliver this as file data, D sockets speak the distributed protocol.
+    /// Inbound sockets store .peer regardless of wire type, so the
+    /// PeerInit-receipt caller must additionally check the parsed type.
+    ///
+    /// Uses plain `send` rather than `send(extension:_:)` — this is the
+    /// bootstrap, sent before either side has advertised anything.
+    private func advertiseExtensionsIfNeeded() async {
+        guard !hasAdvertisedExtensions, connectionType == .peer else { return }
+        // Set before the suspension so a reentrant trigger can't double-send;
+        // reset on failure so a surviving socket can retry from a later one.
+        hasAdvertisedExtensions = true
+        do { try await send(MessageBuilder.extendedClientInfoMessage()) }
+        catch { hasAdvertisedExtensions = false }
+    }
+
+    /// Send an extension message, refusing if the peer never advertised the
+    /// code. Every extension send must go through here: the spec forbids
+    /// sending a code a peer did not advertise, and expressing that per call
+    /// site is how the first three of four sites came to omit it.
+    public func send(extension code: ExtendedClientInfoCode, _ message: Data) async throws {
+        guard supports(code) else { throw PeerError.capabilityNotAdvertised(code) }
+        try await send(message)
+    }
+
+    public func sendPierceFirewall() async throws {
+        let message = MessageBuilder.pierceFirewallMessage(token: token)
+        logger.debug("Sending PierceFirewall to \(self.peerInfo.username) with token \(self.token) (\(message.count) bytes)")
+        try await send(message)
+        // Mark handshake as complete from our side - peer will send peer messages (not init messages) now
+        handshakeComplete = true
+        logger.debug("PierceFirewall sent successfully to \(self.peerInfo.username), handshake complete")
+        await advertiseExtensionsIfNeeded()
+    }
+
+    // MARK: - Peer Messages
+
+    public func requestShares() async throws {
+        let message = MessageBuilder.sharesRequestMessage()
+        logger.debug("[\(self.peerInfo.username)] Sending GetShareFileList (code 4)")
+        try await send(message)
+        logger.debug("[\(self.peerInfo.username)] GetShareFileList sent successfully")
+        logger.info("Requested shares from \(self.peerInfo.username)")
+    }
+
+    /// Send our shared files to a peer (response to SharesRequest)
+    public func sendShares(
+        files: [(directory: String, files: [(filename: String, size: UInt64, bitrate: UInt32?, duration: UInt32?)])],
+        privateFiles: [(directory: String, files: [(filename: String, size: UInt64, bitrate: UInt32?, duration: UInt32?)])] = []
+    ) async throws {
+        let message = MessageBuilder.sharesReplyMessage(files: files, privateFiles: privateFiles)
+        logger.debug("[\(self.peerInfo.username)] Sending SharesReply with \(files.count) public + \(privateFiles.count) private directories")
+        try await send(message)
+        logger.info("Sent shares to \(self.peerInfo.username): \(files.count) public + \(privateFiles.count) private directories")
+    }
+
+    public func requestUserInfo() async throws {
+        let message = MessageBuilder.userInfoRequestMessage()
+        try await send(message)
+    }
+
+    /// Send our user info in response to UserInfoRequest
+    public func sendUserInfo(
+        description: String,
+        picture: Data? = nil,
+        totalUploads: UInt32,
+        queueSize: UInt32,
+        hasFreeSlots: Bool
+    ) async throws {
+        let message = MessageBuilder.userInfoResponseMessage(
+            description: description,
+            picture: picture,
+            totalUploads: totalUploads,
+            queueSize: queueSize,
+            hasFreeSlots: hasFreeSlots
+        )
+        logger.debug("[\(self.peerInfo.username)] Sending UserInfoResponse: desc='\(description)' uploads=\(totalUploads) queue=\(queueSize) freeSlots=\(hasFreeSlots)")
+        try await send(message)
+        logger.info("Sent user info to \(self.peerInfo.username)")
+    }
+
+    public func sendSearchReply(
+        username: String,
+        token: UInt32,
+        results: [(filename: String, size: UInt64, extension_: String, attributes: [(UInt32, UInt32)])],
+        privateResults: [(filename: String, size: UInt64, extension_: String, attributes: [(UInt32, UInt32)])] = []
+    ) async throws {
+        let message = MessageBuilder.searchReplyMessage(
+            username: username,
+            token: token,
+            results: results,
+            privateResults: privateResults
+        )
+        try await send(message)
+    }
+
+    public func queueDownload(filename: String) async throws {
+        let message = MessageBuilder.queueDownloadMessage(filename: filename)
+        try await send(message)
+        logger.info("Queued download: \(filename)")
+    }
+
+    public func sendTransferRequest(direction: FileTransferDirection, token: UInt32, filename: String, size: UInt64? = nil) async throws {
+        let message = MessageBuilder.transferRequestMessage(
+            direction: direction,
+            token: token,
+            filename: filename,
+            fileSize: size
+        )
+        try await send(message)
+    }
+
+    public func sendTransferReply(token: UInt32, allowed: Bool, fileSize: UInt64? = nil, reason: String? = nil) async throws {
+        let message = MessageBuilder.transferReplyMessage(token: token, allowed: allowed, fileSize: fileSize, reason: reason)
+        try await send(message)
+        logger.info("Sent transfer reply: token=\(token) allowed=\(allowed)")
+    }
+
+    public func sendPlaceInQueue(filename: String, place: UInt32) async throws {
+        let message = MessageBuilder.placeInQueueResponseMessage(filename: filename, place: place)
+        try await send(message)
+        logger.info("Sent place in queue: \(filename) position=\(place)")
+    }
+
+    public func sendPlaceInQueueRequest(filename: String) async throws {
+        let message = MessageBuilder.placeInQueueRequestMessage(filename: filename)
+        try await send(message)
+        logger.debug("Sent PlaceInQueueRequest: \(filename)")
+    }
+
+    public func sendUploadDenied(filename: String, reason: String) async throws {
+        let message = MessageBuilder.uploadDeniedMessage(filename: filename, reason: reason)
+        try await send(message)
+        logger.info("Sent upload denied: \(filename) - \(reason)")
+    }
+
+    public func sendUploadFailed(filename: String) async throws {
+        let message = MessageBuilder.uploadFailedMessage(filename: filename)
+        try await send(message)
+        logger.info("Sent upload failed: \(filename)")
+    }
+
+    public func requestFolderContents(token: UInt32, folder: String) async throws {
+        let message = MessageBuilder.folderContentsRequestMessage(token: token, folder: folder)
+        try await send(message)
+        logger.info("Requested folder contents: \(folder)")
+    }
+
+    public func sendFolderContents(token: UInt32, folder: String, files: [(filename: String, size: UInt64, extension_: String, attributes: [(UInt32, UInt32)])]) async throws {
+        let message = MessageBuilder.folderContentsResponseMessage(token: token, folder: folder, files: files)
+        try await send(message)
+        logger.info("Sent folder contents: \(folder) (\(files.count) files)")
+    }
+
+    // MARK: - Data Transfer
+
+    public func send(_ data: Data) async throws {
+        guard let connection else {
+            logger.error("[\(self.peerInfo.username)] send() - no connection!")
+            throw PeerError.notConnected
+        }
+        // Allow sending in connected or handshaking state
+        switch state {
+        case .connected, .handshaking:
+            break
+        default:
+            logger.error("[\(self.peerInfo.username)] send() - wrong state: \(String(describing: self.state))")
+            throw PeerError.notConnected
+        }
+
+        // On obfuscated connections, re-frame the message: the wire format is
+        // key[4] || enc(len_le32) || enc(payload). MessageBuilder output is
+        // already `len_le32 || payload`; strip its length prefix and let the
+        // codec emit the fresh wire bytes. A 4-byte-or-shorter `data` cannot
+        // carry a payload, so guard against underflow.
+        let wire: Data
+        if isObfuscated {
+            guard data.count >= 4 else {
+                logger.error("[\(self.peerInfo.username)] obfuscated send: data shorter than 4 bytes, no length prefix")
+                throw PeerError.malformedOutboundMessage
+            }
+            wire = ObfuscationCodec.encodeMessage(payload: Data(data.dropFirst(4)))
+        } else {
+            wire = data
+        }
+
+        // No per-send debug logs: forwarding distributed traffic to
+        // children makes this a steady-state hot path.
+        //
+        // Cancellation-aware: under TCP backpressure `contentProcessed` may
+        // not fire for minutes; cancelling the socket forces it to fire
+        // (with an error) so a cancelled caller (e.g. user cancels an
+        // upload) resolves instead of sitting wedged. The callback fires
+        // exactly once either way, so single-resume holds.
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                connection.send(content: wire, completion: .contentProcessed { [weak self] error in
+                    if let error {
+                        self?.logger.error("[\(self?.peerInfo.username ?? "??")] send failed: \(error.localizedDescription)")
+                        continuation.resume(throwing: error)
+                    } else {
+                        Task {
+                            await self?.recordSent(wire.count)
+                        }
+                        continuation.resume()
+                    }
+                })
+            }
+        } onCancel: {
+            connection.cancel()
+        }
+    }
+
+    /// Send raw data without length prefix (used for file transfer handshake)
+    public func sendRaw(_ data: Data) async throws {
+        guard let connection else {
+            throw PeerError.notConnected
+        }
+
+        logger.debug("[\(self.peerInfo.username)] Sending RAW \(data.count) bytes")
+
+        // Cancellation-aware for the same reason as `send(_:)`: a wedged
+        // `contentProcessed` under backpressure must not outlive the caller.
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                connection.send(content: data, completion: .contentProcessed { [weak self] error in
+                    if let error {
+                        self?.logger.error("[\(self?.peerInfo.username ?? "??")] sendRaw failed: \(error.localizedDescription)")
+                        continuation.resume(throwing: error)
+                    } else {
+                        self?.logger.debug("[\(self?.peerInfo.username ?? "??")] sendRaw succeeded")
+                        Task {
+                            await self?.recordSent(data.count)
+                        }
+                        continuation.resume()
+                    }
+                })
+            }
+        } onCancel: {
+            connection.cancel()
+        }
+    }
+
+    /// Receive exactly `count` raw bytes with optional timeout (used for file transfer handshake)
+    public func receiveRawBytes(count: Int, timeout: TimeInterval = 10) async throws -> Data {
+        guard let connection else {
+            throw PeerError.notConnected
+        }
+
+        // First, check if we already have enough data in the file transfer buffer
+        // (this can happen when data arrives before we stop the receive loop)
+        if fileTransferBuffer.count >= count {
+            let data = fileTransferBuffer.prefix(count)
+            consumeFileBufferHead(count)
+            logger.debug("[\(self.peerInfo.username)] Got \(count) raw bytes from file transfer buffer")
+            return Data(data)
+        }
+
+        // Cancel the underlying NWConnection on timeout. Without this, the
+        // timeout child throws but the receive continuation stays pending —
+        // `withThrowingTaskGroup` then waits on the orphan child forever, so
+        // the "timeout" never actually returns and the caller sits wedged.
+        return try await withThrowingTaskGroup(of: Data.self) { group in
+            group.addTask { [self] in
+                try await withTaskCancellationHandler {
+                    // Let the message loop's in-flight receive land first so
+                    // we never have two competing receives on one socket;
+                    // its bytes go to fileTransferBuffer and are re-checked.
+                    await waitForMessageLoopToStop()
+                    return try await receiveRawBytesFromSocket(count: count, timeout: timeout, connection: connection)
+                } onCancel: {
+                    // Force the pending receive to fire its callback (with an
+                    // error) so the continuation resolves and this child task
+                    // can finish. cancel() is sync and Sendable.
+                    connection.cancel()
+                }
+            }
+
+            group.addTask {
+                try await Task.sleep(for: .seconds(timeout))
+                throw PeerError.timeout
+            }
+
+            guard let result = try await group.next() else {
+                throw PeerError.timeout
+            }
+            group.cancelAll()
+            return result
+        }
+    }
+
+    /// Re-checks the buffer after the message loop quiesces, then issues the
+    /// actual socket receive for whatever is still missing.
+    private func receiveRawBytesFromSocket(count: Int, timeout: TimeInterval, connection: NWConnection) async throws -> Data {
+        if fileTransferBuffer.count >= count {
+            let data = fileTransferBuffer.prefix(count)
+            consumeFileBufferHead(count)
+            logger.debug("[\(self.peerInfo.username)] Got \(count) raw bytes from file transfer buffer (post-quiesce)")
+            return Data(data)
+        }
+
+        // If we have some buffered data but not enough, we need to receive more
+        let neededFromNetwork = count - fileTransferBuffer.count
+        logger.debug("[\(self.peerInfo.username)] Waiting for \(neededFromNetwork) raw bytes from network (have \(self.fileTransferBuffer.count) buffered, need \(count) total, timeout: \(timeout)s)...")
+
+        // Capture and clear buffer before entering non-isolated closure
+        let bufferedData = fileTransferBuffer
+        clearFileBuffer()
+
+        return try await withCheckedThrowingContinuation { continuation in
+            connection.receive(minimumIncompleteLength: neededFromNetwork, maximumLength: neededFromNetwork) { [weak self] data, _, _, error in
+                if let error {
+                    self?.logger.debug("[\(self?.peerInfo.username ?? "??")] receiveRawBytes error: \(error)")
+                    continuation.resume(throwing: error)
+                } else if let data, data.count >= neededFromNetwork {
+                    self?.logger.debug("[\(self?.peerInfo.username ?? "??")] Received \(data.count) raw bytes from network")
+                    Task {
+                        await self?.recordReceived(data.count)
+                    }
+                    // Combine buffered data with newly received data
+                    if !bufferedData.isEmpty {
+                        var combined = bufferedData
+                        combined.append(data)
+                        continuation.resume(returning: Data(combined.prefix(count)))
+                    } else {
+                        continuation.resume(returning: data)
+                    }
+                } else {
+                    self?.logger.debug("[\(self?.peerInfo.username ?? "??")] Received incomplete data: \(data?.count ?? 0)/\(neededFromNetwork)")
+                    continuation.resume(throwing: PeerError.connectionClosed)
+                }
+            }
+        }
+    }
+
+    /// Result type for file chunk reception - distinguishes between data, completion, and errors
+    public enum FileChunkResult: Sendable {
+        case data(Data)
+        case dataWithCompletion(Data)  // Data received AND connection is now complete
+        case connectionComplete
+    }
+
+    /// Receive file data in chunks for file transfers
+    /// Uses 1MB buffer by default for better throughput
+    public func receiveFileChunk(maxLength: Int = 1024 * 1024) async throws -> FileChunkResult {
+        guard let connection else {
+            throw PeerError.notConnected
+        }
+
+        // First, check if we have buffered data from when the receive loop was stopped
+        if let chunk = takeFileChunkFromBuffer(maxLength: maxLength) {
+            logger.debug("Using \(chunk.count) bytes from file transfer buffer")
+            return .data(chunk)
+        }
+
+        // Let the message loop's in-flight receive land, then re-check the
+        // buffer: its bytes must be consumed in order, before fresh receives.
+        await waitForMessageLoopToStop()
+        if let chunk = takeFileChunkFromBuffer(maxLength: maxLength) {
+            logger.debug("Using \(chunk.count) bytes from file transfer buffer (post-quiesce)")
+            return .data(chunk)
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            // `minimumIncompleteLength: 1` blocks until at least one byte is
+            // available (or the connection closes), so we never spin returning
+            // empty `.data(Data())` while the socket is still open. With
+            // `0`, NWConnection happily returns immediately with empty data,
+            // and the receive loop in `receiveFileDataFromPeer` would burn
+            // through that as another iteration — pinning a CPU core and
+            // racing the outer 30s timeout instead of cleanly waiting for
+            // bytes. The dedicated drain helper (`drainAvailableData`)
+            // intentionally still uses `0` because *that* path expects to
+            // return immediately after the connection signals complete.
+            connection.receive(minimumIncompleteLength: 1, maximumLength: maxLength) { [weak self] data, _, isComplete, error in
+                if let error {
+                    // Real error - but still try to return any data we got
+                    if let data, !data.isEmpty {
+                        Task { await self?.recordReceived(data.count) }
+                        continuation.resume(returning: .dataWithCompletion(data))
+                    } else {
+                        continuation.resume(throwing: error)
+                    }
+                } else if let data, !data.isEmpty {
+                    Task {
+                        await self?.recordReceived(data.count)
+                    }
+                    // If we have data AND connection is complete, signal both
+                    if isComplete {
+                        continuation.resume(returning: .dataWithCompletion(data))
+                    } else {
+                        continuation.resume(returning: .data(data))
+                    }
+                } else if isComplete {
+                    // Connection cleanly closed with no more data
+                    continuation.resume(returning: .connectionComplete)
+                } else {
+                    // With minimumIncompleteLength=1 this branch should not
+                    // trigger except on cancellation; treat as completion to
+                    // exit the receive loop deterministically.
+                    continuation.resume(returning: .connectionComplete)
+                }
+            }
+        }
+    }
+
+    /// Dequeue up to `maxLength` bytes from the file transfer buffer.
+    private func takeFileChunkFromBuffer(maxLength: Int) -> Data? {
+        guard !fileTransferBuffer.isEmpty else { return nil }
+        let chunk: Data
+        if fileTransferBuffer.count <= maxLength {
+            chunk = fileTransferBuffer
+            clearFileBuffer()
+        } else {
+            chunk = Data(fileTransferBuffer.prefix(maxLength))
+            consumeFileBufferHead(maxLength)
+        }
+        return chunk
+    }
+
+    /// All head-consumption of `fileTransferBuffer` goes through these so
+    /// `fileBufferDecodedPrefixLength` tracks reality — a stale boundary
+    /// would restore undecoded cipher bytes to `receiveBuffer` as plain on
+    /// browse resume.
+    private func consumeFileBufferHead(_ count: Int) {
+        fileTransferBuffer.removeFirst(count)
+        fileBufferDecodedPrefixLength = max(0, fileBufferDecodedPrefixLength - count)
+    }
+
+    private func clearFileBuffer() {
+        fileTransferBuffer.removeAll()
+        fileBufferDecodedPrefixLength = 0
+    }
+
+    // Flag to stop the receive loop for raw file transfers
+    private var shouldStopReceiving = false
+
+    // Buffer for file transfer data received after stopping message parsing
+    private var fileTransferBuffer = Data()
+
+    // True while the message loop has an NWConnection.receive in flight.
+    // Raw readers must wait for it to land before issuing their own receive,
+    // or NWConnection delivers bytes to the loop first (out-of-order data).
+    private var messageLoopReceiveArmed = false
+    private var messageLoopIdleWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    /// Called on every non-rearm exit of the message loop's receive callback.
+    private func markMessageLoopReceiveLanded() {
+        messageLoopReceiveArmed = false
+        let waiters = messageLoopIdleWaiters
+        messageLoopIdleWaiters.removeAll()
+        for waiter in waiters.values {
+            waiter.resume()
+        }
+    }
+
+    /// Suspends until the message loop has stopped entirely — i.e. its
+    /// in-flight receive has landed on a non-rearm exit and no new receive
+    /// was armed. Callers must have set `shouldStopReceiving` (directly or
+    /// via a handshake message) or this can wait indefinitely.
+    private func waitForMessageLoopToStop() async {
+        guard messageLoopReceiveArmed else { return }
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if messageLoopReceiveArmed {
+                    messageLoopIdleWaiters[id] = continuation
+                } else {
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            Task { await self.resumeIdleWaiter(id) }
+        }
+    }
+
+    private func resumeIdleWaiter(_ id: UUID) {
+        messageLoopIdleWaiters.removeValue(forKey: id)?.resume()
+    }
+
+    /// Stop the normal receive loop so we can do raw file transfers
+    public func stopReceiving() {
+        shouldStopReceiving = true
+        // Clear the message receive buffer - any pending data will go to file transfer buffer
+        receiveBuffer.removeAll()
+        migrateObfuscatedTailToFileBuffer()
+        logger.info("Stopping receive loop for file transfer")
+        logger.debug("[\(self.peerInfo.username)] Stopped receive loop, cleared message buffer")
+    }
+
+    /// Get any data that was received after stopReceiving() was called
+    public func getFileTransferBuffer() -> Data {
+        let data = fileTransferBuffer
+        clearFileBuffer()
+        return data
+    }
+
+    /// Prepend data back to the file transfer buffer (for partial reads).
+    /// Pushed-back bytes were consumed from the decoded head, so the
+    /// decoded-prefix boundary grows with them.
+    public func prependToFileTransferBuffer(_ data: Data) {
+        fileTransferBuffer = data + fileTransferBuffer
+        fileBufferDecodedPrefixLength += data.count
+    }
+
+    /// Drain any available data from the connection without blocking
+    /// Used after connection signals complete to get remaining buffered data
+    public func drainAvailableData(maxLength: Int = 65536, timeout: TimeInterval = 0.5) async -> Data {
+        guard let connection else {
+            return Data()
+        }
+
+        do {
+            return try await withThrowingTaskGroup(of: Data.self) { group in
+                group.addTask {
+                    try await withTaskCancellationHandler {
+                        try await withCheckedThrowingContinuation { continuation in
+                            // Use minimumIncompleteLength: 0 to return immediately with whatever is available
+                            connection.receive(minimumIncompleteLength: 0, maximumLength: maxLength) { [weak self] data, _, isComplete, error in
+                                if let error {
+                                    continuation.resume(throwing: error)
+                                } else if let data, !data.isEmpty {
+                                    Task { await self?.recordReceived(data.count) }
+                                    continuation.resume(returning: data)
+                                } else {
+                                    // No data available
+                                    continuation.resume(returning: Data())
+                                }
+                            }
+                        }
+                    } onCancel: {
+                        // Resolve a pending receive so the timeout can return.
+                        // Safe: only called after the transfer completed.
+                        connection.cancel()
+                    }
+                }
+
+                group.addTask {
+                    try await Task.sleep(for: .seconds(timeout))
+                    return Data() // Return empty on timeout
+                }
+
+                if let result = try await group.next() {
+                    group.cancelAll()
+                    return result
+                }
+                return Data()
+            }
+        } catch {
+            return Data()
+        }
+    }
+
+    // MARK: - Private Methods
+
+    private func handleConnectionState(_ state: NWConnection.State, generation: UInt64, continuation: CheckedContinuation<Void, Error>?) {
+        // Drop events from abandoned attempts: a stale socket's late
+        // .cancelled/.failed must not resume the live attempt's continuation,
+        // reset the shared flag, cancel the live connection, or stomp state.
+        guard generation == connectAttemptGeneration else {
+            logger.debug("Ignoring stale connection state (gen \(generation) < \(self.connectAttemptGeneration)): \(String(describing: state))")
+            return
+        }
+        switch state {
+        case .ready:
+            logger.info("Peer connected: \(self.peerInfo.username) at \(self.peerInfo.ip):\(self.peerInfo.port)")
+            connectedAt = Date()
+            connectionEstablishedGeneration = generation
+            updateState(.connected)
+            // Only auto-start receiving if flag is set (for outgoing connections)
+            // For incoming connections, we delay until callbacks are configured
+            if autoStartReceiving {
+                startReceiving()
+            }
+            if !connectContinuationResumed {
+                connectContinuationResumed = true
+                continuation?.resume()
+            }
+
+        case .failed(let error):
+            // Timeouts / refused / reset for peers on the Soulseek
+            // network are normal operating conditions (firewalled or
+            // dead peers), not actionable errors. Logging each failure
+            // three times at .error level was generating ~19k lines
+            // per session and tripping os_log's 32Hz rate limit.
+            // Collapse to one .debug line; anything unexpected still
+            // lands via the .failed(error) state downstream.
+            logger.debug("Peer connection failed: \(self.peerInfo.username) at \(self.peerInfo.ip):\(self.peerInfo.port) — \(error.localizedDescription)")
+            updateState(.failed(error))
+            // Cancel the connection to free resources
+            connection?.cancel()
+            connection = nil
+            if !connectContinuationResumed {
+                connectContinuationResumed = true
+                continuation?.resume(throwing: error)
+            }
+            // Established connection died: end the event stream (after the
+            // .stateChanged yield above) so the pool's consume loop exits.
+            // Gated so a stale bind-retry socket can't finish the live stream.
+            if connectionEstablishedGeneration == generation {
+                eventContinuation.finish()
+            }
+
+        case .waiting(let error):
+            logger.debug("Peer connection waiting: \(self.peerInfo.username) at \(self.peerInfo.ip):\(self.peerInfo.port)")
+            logger.debug("Waiting error: \(error)")
+            // Check if this is a definitive failure (not just a transient condition)
+            // POSIX errors: 12 (ENOMEM), 51 (ENETUNREACH), 57 (ENOTCONN), 60 (ETIMEDOUT), 61 (ECONNREFUSED), 65 (EHOSTUNREACH)
+            if case .posix(let posixError) = error {
+                let code = posixError.rawValue
+                if code == 12 || code == 51 || code == 57 || code == 60 || code == 61 || code == 65 {
+                    // These are definitive failures, not transient
+                    logger.error("Peer connection definitive failure: \(self.peerInfo.username) - POSIX \(code)")
+                    updateState(.failed(error))
+                    // Cancel connection to free resources
+                    connection?.cancel()
+                    connection = nil
+                    if !connectContinuationResumed {
+                        connectContinuationResumed = true
+                        continuation?.resume(throwing: error)
+                    }
+                }
+            }
+
+        case .preparing:
+            logger.debug("Peer connection preparing: \(self.peerInfo.username) -> \(self.peerInfo.ip):\(self.peerInfo.port)")
+
+        case .cancelled:
+            logger.info("Peer connection cancelled: \(self.peerInfo.username)")
+            updateState(.disconnected)
+            // Resume with cancellation error if not already resumed (e.g., timeout cancelled the connection)
+            if !connectContinuationResumed {
+                connectContinuationResumed = true
+                continuation?.resume(throwing: CancellationError())
+            }
+            if connectionEstablishedGeneration == generation {
+                eventContinuation.finish()
+            }
+
+        case .setup:
+            break
+
+        @unknown default:
+            break
+        }
+    }
+
+    /// Resume receiving for P connections (browse) after PierceFirewall
+    /// PierceFirewall normally stops the receive loop for file transfers,
+    /// but P connections need to continue receiving peer messages (SharesReply, etc.)
+    public func resumeReceivingForPeerConnection() async {
+        // A pierced socket never carries a PeerInit in either direction, so
+        // this promotion to P-mode is its only advertisement trigger.
+        await advertiseExtensionsIfNeeded()
+
+        guard shouldStopReceiving else {
+            logger.debug("[\(self.peerInfo.username)] resumeReceivingForPeerConnection: already receiving")
+            return
+        }
+
+        logger.debug("[\(self.peerInfo.username)] Resuming receive loop for P connection (browse)")
+        shouldStopReceiving = false
+
+        // Move buffered data back: decoded prefix to receiveBuffer, any
+        // undecoded obfuscated tail back to obfuscatedBuffer for the codec.
+        if !fileTransferBuffer.isEmpty {
+            let boundary = isObfuscated
+                ? min(fileBufferDecodedPrefixLength, fileTransferBuffer.count)
+                : fileTransferBuffer.count
+            receiveBuffer.append(fileTransferBuffer.prefix(boundary))
+            if boundary < fileTransferBuffer.count {
+                obfuscatedBuffer.append(fileTransferBuffer.dropFirst(boundary))
+            }
+            fileTransferBuffer.removeAll()
+            logger.debug("[\(self.peerInfo.username)] Restored \(boundary) decoded bytes to receive buffer, \(self.obfuscatedBuffer.count) undecoded to obfuscated buffer")
+        }
+        fileBufferDecodedPrefixLength = 0
+
+        startReceiving()
+    }
+
+    /// Bring a pierced P socket up to parity with a direct one — the incoming
+    /// PierceFirewall is its handshake, and PierceFirewall stops the receive
+    /// loop assuming file-transfer mode.
+    public func finalizeIndirectPeerConnection() async throws {
+        await resumeReceivingForPeerConnection()
+        try await waitForPeerHandshake(timeout: .seconds(5))
+    }
+
+    private func startReceiving() {
+        guard let connection else {
+            logger.warning("[\(self.peerInfo.username)] startReceiving called but no connection!")
+            // A rearm that finds no connection still has to release waiters.
+            markMessageLoopReceiveLanded()
+            return
+        }
+
+        // No log: rearmed once per receive event.
+        messageLoopReceiveArmed = true
+
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 262144) { [weak self] data, _, isComplete, error in
+            guard let self else {
+                // self is nil, cannot log
+                return
+            }
+
+            Task {
+                let username = self.peerInfo.username
+                if let error {
+                    self.logger.debug("[\(username)] Receive error: \(error.localizedDescription)")
+                }
+
+                // Wire-level accounting: this is the P-connection message
+                // loop's only entry point, so count here regardless of
+                // whether the bytes go to the parser or the file buffer.
+                // (The raw/file receive paths record at their own sockets.)
+                if let data, !data.isEmpty {
+                    await self.recordReceived(data.count)
+                }
+
+                // Check if we should stop BEFORE processing data
+                if await self.shouldStopReceiving {
+                    // Store data for file transfer instead of parsing as messages
+                    if let data {
+                        await self.appendToFileTransferBuffer(data)
+                        self.logger.debug("[\(username)] Receive loop stopped, stored \(data.count) bytes for file transfer")
+                    }
+                    await self.markMessageLoopReceiveLanded()
+                    return // Don't continue receive loop
+                }
+
+                if let data {
+                    await self.handleReceivedData(data)
+                } else {
+                    self.logger.debug("[\(username)] No data received")
+                }
+
+                // Re-check shouldStopReceiving AFTER processing data.
+                // This is critical because handleReceivedData may have processed
+                // a PierceFirewall message that set shouldStopReceiving = true
+                // and already started a receiveRawBytes() call.
+                // If we start another receive here, we'd have two concurrent
+                // receives and cause a race condition.
+                if await self.shouldStopReceiving {
+                    self.logger.debug("[\(username)] Receive loop stopped after processing (file transfer mode)")
+                    await self.markMessageLoopReceiveLanded()
+                    return
+                }
+
+                if isComplete {
+                    self.logger.debug("[\(username)] Connection complete, disconnecting")
+                    await self.disconnect()
+                    await self.markMessageLoopReceiveLanded()
+                } else if error == nil {
+                    await self.startReceiving()
+                } else {
+                    self.logger.debug("[\(username)] Not continuing receive due to error")
+                    await self.markMessageLoopReceiveLanded()
+                }
+            }
+        }
+    }
+
+    private func appendToFileTransferBuffer(_ data: Data) {
+        fileTransferBuffer.append(data)
+    }
+
+    /// On obfuscated connections, fileTransferBuffer can hold decoded plain
+    /// bytes (moved from receiveBuffer at a flip) followed by undecoded wire
+    /// bytes. This boundary lets `resumeReceivingForPeerConnection` split
+    /// them back instead of feeding cipher bytes to the plain parser.
+    private var fileBufferDecodedPrefixLength = 0
+
+    /// Call at every plain→file-mode flip, after moving receiveBuffer over:
+    /// records the decoded/undecoded boundary and migrates any undecoded
+    /// obfuscated tail so it isn't stranded in `obfuscatedBuffer`.
+    private func migrateObfuscatedTailToFileBuffer() {
+        fileBufferDecodedPrefixLength = fileTransferBuffer.count
+        guard isObfuscated, !obfuscatedBuffer.isEmpty else { return }
+        logger.debug("[\(self.peerInfo.username)] Moving \(self.obfuscatedBuffer.count) undecoded obfuscated bytes to file transfer buffer")
+        fileTransferBuffer.append(obfuscatedBuffer)
+        obfuscatedBuffer.removeAll()
+    }
+
+    // Track if we've completed handshake
+    private var handshakeComplete = false
+    private var peerHandshakeReceived = false  // True when we receive peer's PeerInit
+    private var peerUsername: String = ""
+
+    /// Continuations parked in `waitForPeerHandshake`, resumed when the
+    /// peer's PeerInit/PierceFirewall lands. Replaces a 50ms poll loop.
+    private var handshakeWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    /// Sole setter of `peerHandshakeReceived` — resumes all parked waiters.
+    private func markPeerHandshakeReceived() {
+        peerHandshakeReceived = true
+        let waiters = handshakeWaiters
+        handshakeWaiters.removeAll()
+        for waiter in waiters.values {
+            waiter.resume()
+        }
+    }
+
+    /// Double-resume-safe via removeValue (cancellation vs. handshake race).
+    private func resumeHandshakeWaiter(_ id: UUID) {
+        handshakeWaiters.removeValue(forKey: id)?.resume()
+    }
+
+    /// Suspends until the peer handshake has been received (or the
+    /// surrounding task is cancelled — caller re-checks state after).
+    private func suspendUntilPeerHandshake() async {
+        guard !peerHandshakeReceived else { return }
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if peerHandshakeReceived {
+                    continuation.resume()
+                } else {
+                    handshakeWaiters[id] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.resumeHandshakeWaiter(id) }
+        }
+    }
+
+    /// Wait for an inbound peer initializer (PeerInit or PierceFirewall).
+    /// Outgoing direct P connections must not call this after sending their
+    /// own PeerInit: direct initialization is one-way, and the remote peer is
+    /// not required to send a reciprocal PeerInit on the same socket.
+    public func waitForPeerHandshake(timeout: Duration = .seconds(10)) async throws {
+        if !peerHandshakeReceived {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    await self.suspendUntilPeerHandshake()
+                    // Resumed by cancellation, not handshake? Surface it.
+                    try Task.checkCancellation()
+                }
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    throw PeerError.timeout
+                }
+                do {
+                    try await group.next()
+                    group.cancelAll()
+                } catch {
+                    group.cancelAll()
+                    if error is PeerError {
+                        self.logger.warning("[\(self.peerInfo.username)] Timeout waiting for peer handshake")
+                    }
+                    throw error
+                }
+            }
+        }
+        logger.info("[\(self.peerInfo.username)] Peer handshake received")
+    }
+
+    // MARK: - Security Constants
+    /// Maximum receive buffer size to prevent memory exhaustion from malicious peers
+    /// Must be larger than max message size (100MB) to allow buffering of large share lists
+    private static let maxReceiveBufferSize = 150 * 1024 * 1024  // 150MB
+
+    /// Maximum peer-message payload length we'll accept. Matches the plain
+    /// parser's per-message length sanity check in `handleReceivedData` so
+    /// obfuscated connections don't silently reject large browse/share-list
+    /// responses that would succeed plain.
+    private static let maxPeerMessageLength = 100_000_000  // 100MB
+
+    private func handleReceivedData(_ data: Data) async {
+        bytesReceived += UInt64(data.count)
+        touchLastActivity()
+
+        if isObfuscated {
+            obfuscatedBuffer.append(data)
+            // SECURITY: guard the raw wire buffer the same way as the plain one.
+            guard obfuscatedBuffer.count <= Self.maxReceiveBufferSize else {
+                logger.error("SECURITY: [\(self.peerInfo.username)] obfuscated wire buffer exceeded limit, disconnecting")
+                obfuscatedBuffer.removeAll()
+                disconnect()
+                return
+            }
+            // Drain as many complete obfuscated messages as we can into the plain
+            // receiveBuffer, re-prepending the length so the existing length-prefixed
+            // parser below sees them exactly the way it sees plain messages.
+            while true {
+                do {
+                    guard let decoded = try ObfuscationCodec.decodeMessage(
+                        from: obfuscatedBuffer,
+                        maxPayloadLength: Self.maxPeerMessageLength
+                    ) else {
+                        break
+                    }
+                    obfuscatedBuffer.removeFirst(decoded.bytesConsumed)
+                    var plain = Data()
+                    plain.appendUInt32(UInt32(decoded.payload.count))
+                    plain.append(decoded.payload)
+                    receiveBuffer.append(plain)
+                } catch {
+                    logger.error("[\(self.peerInfo.username)] obfuscated decode failed: \(String(describing: error)), disconnecting")
+                    obfuscatedBuffer.removeAll()
+                    receiveBuffer.removeAll()
+                    disconnect()
+                    return
+                }
+            }
+        } else {
+            receiveBuffer.append(data)
+        }
+
+        // SECURITY: Check buffer size to prevent memory exhaustion
+        guard receiveBuffer.count <= Self.maxReceiveBufferSize else {
+            logger.error("Receive buffer exceeded limit (\(Self.maxReceiveBufferSize) bytes), disconnecting malicious peer")
+            logger.error("SECURITY: [\(self.peerInfo.username)] Buffer overflow protection triggered, disconnecting")
+            receiveBuffer.removeAll()
+            disconnect()
+            return
+        }
+
+        // No per-receive logging here, even in debug builds: a healthy
+        // distributed parent delivers 5-50 packets/s continuously, and a
+        // hex dump per packet drowns the console. Parse-FAILURE paths
+        // still dump hex (rare, actually diagnostic).
+
+        // Parse messages - init messages use 1-byte codes, peer messages use 4-byte codes
+        while receiveBuffer.count >= 5 {
+            guard let length = receiveBuffer.readUInt32(at: 0) else {
+                logger.debug("[\(self.peerInfo.username)] Failed to read message length")
+                break
+            }
+
+            // Sanity check - messages shouldn't be larger than 100MB
+            guard length <= 100_000_000 else {
+                logger.warning("[\(self.peerInfo.username)] Invalid message length: \(length) - likely file transfer data on wrong connection")
+                receiveBuffer.removeAll()
+                break
+            }
+
+            let totalLength = 4 + Int(length)
+            guard receiveBuffer.count >= totalLength else {
+                logger.debug("[\(self.peerInfo.username)] Waiting for more data: have \(self.receiveBuffer.count), need \(totalLength)")
+                break
+            }
+
+            // Check if this is an init message (1-byte code) or peer message (4-byte code)
+            guard let firstByte = receiveBuffer.readByte(at: 4) else {
+                logger.debug("[\(self.peerInfo.username)] Failed to read first byte")
+                break
+            }
+
+            if !handshakeComplete && (firstByte == 0 || firstByte == 1) {
+                // Init message with 1-byte code
+                logger.debug("[\(self.peerInfo.username)] Init message: code=\(firstByte) length=\(length)")
+                let payload = receiveBuffer.safeSubdata(in: 5..<totalLength) ?? Data()
+                receiveBuffer.removeFirst(totalLength)
+                messagesReceived += 1
+
+                await handleInitMessage(code: firstByte, payload: payload)
+            } else if connectionType == .distributed {
+                // Distributed messages use 1-byte code: uint32 length + uint8 code + payload
+                // No per-message log: steady-state relay traffic is 5-50/sec.
+                let code = UInt32(firstByte)
+                let payload = receiveBuffer.safeSubdata(in: 5..<totalLength) ?? Data()
+
+                receiveBuffer.removeFirst(totalLength)
+                messagesReceived += 1
+
+                // Route to distributed message handler
+                eventContinuation.yield(.message(code: code, payload: payload))
+            } else {
+                // Peer message with 4-byte code
+                // Minimum valid peer message: 4 bytes length + 4 bytes code = 8 bytes total, so length >= 4
+                guard length >= 4 else {
+                    logger.warning("[\(self.peerInfo.username)] Invalid peer message length \(length) < 4 - likely raw file transfer data")
+                    // This data is not a valid peer message - could be file transfer data on wrong connection
+                    // Move to file transfer buffer and stop parsing
+                    fileTransferBuffer.append(receiveBuffer)
+                    receiveBuffer.removeAll()
+                    break
+                }
+                guard receiveBuffer.count >= 8 else {
+                    logger.debug("[\(self.peerInfo.username)] Buffer too small for peer message header")
+                    break
+                }
+                guard let code = receiveBuffer.readUInt32(at: 4) else {
+                    logger.debug("[\(self.peerInfo.username)] Failed to read message code")
+                    break
+                }
+                #if DEBUG
+                // Skip the distributed stream: 5-50 search packets/s would
+                // drown the console even in debug builds.
+                if connectionType != .distributed {
+                    let codeDescription = code <= 255 ? (PeerMessageCode(rawValue: UInt8(code))?.description ?? "unknown") : "invalid(\(code))"
+                    logger.debug("[\(self.peerInfo.username)] Peer message: code=\(code) (\(codeDescription)) length=\(length)")
+                }
+                #endif
+                let payload = receiveBuffer.safeSubdata(in: 8..<totalLength) ?? Data()
+
+                receiveBuffer.removeFirst(totalLength)
+                messagesReceived += 1
+
+                await handlePeerMessage(code: code, payload: payload)
+            }
+        }
+    }
+
+    private func handleInitMessage(code: UInt8, payload: Data) async {
+        logger.info("Received init message: code=\(code) length=\(payload.count)")
+
+        switch code {
+        case PeerMessageCode.pierceFirewall.rawValue:
+            // Firewall pierce - extract token and notify for matching to pending downloads
+            // This connection will now be used for file transfer (raw bytes, no message framing)
+            if let token = payload.readUInt32(at: 0) {
+                logger.info("PierceFirewall received with token: \(token)")
+
+                // CRITICAL: Stop receive loop IMMEDIATELY before invoking callback
+                // After PierceFirewall, the connection switches to raw file transfer mode.
+                // The next bytes will be FileOffset (8 raw bytes), not a length-prefixed message.
+                shouldStopReceiving = true
+                logger.debug("PierceFirewall: stopped receive loop for file transfer mode")
+
+                // Move any remaining receive buffer data to file transfer buffer
+                if !receiveBuffer.isEmpty {
+                    fileTransferBuffer.append(receiveBuffer)
+                    logger.debug("PierceFirewall: moved \(self.receiveBuffer.count) bytes to file transfer buffer")
+                    receiveBuffer.removeAll()
+                }
+                migrateObfuscatedTailToFileBuffer()
+
+                eventContinuation.yield(.pierceFirewall(token: token))
+            }
+            handshakeComplete = true
+            markPeerHandshakeReceived()
+
+        case PeerMessageCode.peerInit.rawValue:
+            // Peer init - extract username, type, token
+            var offset = 0
+
+            if let (username, usernameLen) = payload.readString(at: offset) {
+                offset += usernameLen
+                // Use setPeerUsername so the nonisolated peerInfo.username
+                // mirror is also updated. Consumers like
+                // DownloadManager.handlePoolTransferRequest read peerInfo
+                // synchronously to identify which peer delivered an event,
+                // so leaving peerInfo.username empty after PeerInit causes
+                // routing fallbacks to fail.
+                setPeerUsername(username)
+
+                var peerToken: UInt32 = 0
+                var connType: String = "P"
+                if let (type, typeLen) = payload.readString(at: offset) {
+                    offset += typeLen
+                    connType = type
+
+                    if let token = payload.readUInt32(at: offset) {
+                        peerToken = token
+                        logger.info("PeerInit from \(username) type=\(connType) token=\(token)")
+                    }
+                }
+
+                // Handle based on connection type
+                if connType == "F" {
+                    // File transfer connection - notify for file data handling
+                    logger.info("File transfer connection from \(username) token=\(peerToken)")
+                    logger.info("F connection detected: username='\(username)' token=\(peerToken)")
+
+                    // CRITICAL: Stop receive loop IMMEDIATELY before invoking callback
+                    // This prevents race condition where receive loop consumes FileTransferInit bytes
+                    // before the callback handler can call stopReceiving()
+                    shouldStopReceiving = true
+                    logger.debug("F connection: stopped receive loop preemptively")
+
+                    // Move any remaining receive buffer data to file transfer buffer
+                    // This preserves FileTransferInit bytes that may have been received
+                    if !receiveBuffer.isEmpty {
+                        fileTransferBuffer.append(receiveBuffer)
+                        logger.debug("F connection: moved \(self.receiveBuffer.count) bytes from receive buffer to file transfer buffer")
+                        receiveBuffer.removeAll()
+                    }
+                    migrateObfuscatedTailToFileBuffer()
+
+                    logger.debug("F connection detected, yielding fileTransferConnection event")
+                    eventContinuation.yield(.fileTransferConnection(username: username, token: peerToken, connection: self))
+                    logger.debug("F connection event yielded")
+                } else {
+                    // Regular peer connection - notify the pool
+                    eventContinuation.yield(.usernameDiscovered(username: username, token: peerToken))
+                    // Gate on the parsed wire type, not the stored one:
+                    // inbound sockets store .peer even for a "D" PeerInit.
+                    if connType == "P" {
+                        await advertiseExtensionsIfNeeded()
+                    }
+                }
+            }
+            handshakeComplete = true
+            markPeerHandshakeReceived()
+            logger.info("[\(self.peerUsername)] Peer handshake complete (received PeerInit)")
+
+        default:
+            logger.warning("Unknown init message code: \(code)")
+            // Assume handshake is done and this might be a peer message.
+            // Also release waitForPeerHandshake callers — without this they
+            // block the full 10s timeout and then fail.
+            handshakeComplete = true
+            markPeerHandshakeReceived()
+        }
+    }
+
+    private func handlePeerMessage(code: UInt32, payload: Data) async {
+        // Handle based on message code
+        switch code {
+        case UInt32(PeerMessageCode.sharesRequest.rawValue):
+            logger.info("[\(self.peerInfo.username)] Received SharesRequest - peer wants to browse us")
+            handleSharesRequest()
+
+        case UInt32(PeerMessageCode.sharesReply.rawValue):
+            logger.debug("[\(self.peerInfo.username)] Routing to handleSharesReply...")
+            await handleSharesReply(payload)
+
+        case UInt32(PeerMessageCode.searchReply.rawValue):
+            await handleSearchReply(payload)
+
+        case UInt32(PeerMessageCode.userInfoReply.rawValue):
+            await handleUserInfoReply(payload)
+
+        case UInt32(PeerMessageCode.transferRequest.rawValue):
+            await handleTransferRequest(payload)
+
+        case UInt32(PeerMessageCode.transferReply.rawValue):
+            await handleTransferReply(payload)
+
+        case UInt32(PeerMessageCode.queueDownload.rawValue):
+            await handleQueueDownload(payload)
+
+        case UInt32(PeerMessageCode.placeInQueueReply.rawValue):
+            await handlePlaceInQueue(payload)
+
+        case UInt32(PeerMessageCode.uploadFailed.rawValue):
+            await handleUploadFailed(payload)
+
+        case UInt32(PeerMessageCode.uploadDenied.rawValue):
+            await handleUploadDenied(payload)
+
+        case UInt32(PeerMessageCode.folderContentsRequest.rawValue):
+            await handleFolderContentsRequest(payload)
+
+        case UInt32(PeerMessageCode.folderContentsReply.rawValue):
+            await handleFolderContentsReply(payload)
+
+        case UInt32(PeerMessageCode.placeInQueueRequest.rawValue):
+            await handlePlaceInQueueRequest(payload)
+
+        case UInt32(PeerMessageCode.uploadQueueNotification.rawValue):
+            logger.debug("Received UploadQueueNotification (deprecated)")
+
+        case UInt32(PeerMessageCode.userInfoRequest.rawValue):
+            handleUserInfoRequest()
+
+        // SeeleSeek extension codes
+        case ExtendedClientInfoCode.extendedClientInfo.rawValue:
+            handleExtendedClientInfo(payload)
+
+        case ExtendedClientInfoCode.artworkRequest.rawValue:
+            handleArtworkRequest(payload)
+
+        case ExtendedClientInfoCode.artworkReply.rawValue:
+            handleArtworkReply(payload)
+
+        default:
+            logger.debug("Unhandled peer message code: \(code)")
+            eventContinuation.yield(.message(code: code, payload: payload))
+        }
+    }
+
+    /// Handle SharesRequest (code 4) - peer wants to browse our shared files
+    private func handleSharesRequest() {
+        logger.info("Peer \(self.peerUsername) requested our shares")
+        logger.debug("[\(self.peerUsername)] Peer wants to browse our shares, yielding event...")
+        eventContinuation.yield(.sharesRequest)
+    }
+
+    /// Handle UserInfoRequest (code 15) - peer wants our user info
+    private func handleUserInfoRequest() {
+        logger.info("Peer \(self.peerUsername) requested our user info")
+        logger.debug("[\(self.peerUsername)] Peer wants our user info, yielding event...")
+        eventContinuation.yield(.userInfoRequest)
+    }
+
+    // MARK: - SeeleSeek Extension Handlers
+
+    /// Handle ExtendedClientInfo (code 10000) — record what this peer speaks.
+    ///
+    /// SeeleSeek 1.x sent a bare uint8 version at this code. That does not
+    /// parse and is deliberately not special-cased: the spec treats a peer
+    /// that has not sent a valid advertisement as supporting nothing, and
+    /// inferring capabilities from a version byte is the exact practice this
+    /// handshake replaces.
+    private func handleExtendedClientInfo(_ payload: Data) {
+        guard !extensionsMisbehaving else { return }
+
+        guard let info = MessageParser.parseExtendedClientInfo(payload) else {
+            // Malformed here means a buggy or hostile peer, not line noise —
+            // fail closed for the rest of the socket.
+            logger.warning("[\(self.peerUsername)] ExtendedClientInfo malformed or unknown revision, marking peer misbehaving")
+            markExtensionsMisbehaving()
+            return
+        }
+
+        // First advertisement wins; capabilities never change mid-socket.
+        guard extendedClientInfo == nil else {
+            extendedClientInfoResends += 1
+            if extendedClientInfoResends >= Self.maxExtendedClientInfoResends {
+                logger.warning("[\(self.peerUsername)] ExtendedClientInfo re-sent \(self.extendedClientInfoResends) times, marking peer misbehaving")
+                markExtensionsMisbehaving()
+            } else if extendedClientInfo != info {
+                logger.warning("[\(self.peerUsername)] ExtendedClientInfo changed mid-connection, keeping original")
+            }
+            return
+        }
+
+        extendedClientInfo = info
+        logger.info("[\(self.peerUsername)] Extensions: \(info.capabilities.keys.sorted().joined(separator: ", "))")
+        eventContinuation.yield(.extendedClientInfoDiscovered(info))
+    }
+
+    private func markExtensionsMisbehaving() {
+        extensionsMisbehaving = true
+        extendedClientInfo = nil
+    }
+
+    /// Test seam: drive the private 10000 handler with a raw payload.
+    func _handleExtendedClientInfoForTest(_ payload: Data) {
+        handleExtendedClientInfo(payload)
+    }
+
+    /// Handle artwork request (code 10001) — peer wants album art for a file.
+    private func handleArtworkRequest(_ payload: Data) {
+        var offset = 0
+        guard let token = payload.readUInt32(at: offset) else {
+            logger.warning("[\(self.peerUsername)] ArtworkRequest: missing token")
+            return
+        }
+        offset += 4
+        guard let (filePath, _) = payload.readString(at: offset) else {
+            logger.warning("[\(self.peerUsername)] ArtworkRequest: missing filePath")
+            return
+        }
+        logger.info("[\(self.peerUsername)] ArtworkRequest: token=\(token) file=\(filePath)")
+        eventContinuation.yield(.artworkRequest(token: token, filePath: filePath))
+    }
+
+    /// Handle artwork reply (code 10002) — peer sent us album art.
+    private func handleArtworkReply(_ payload: Data) {
+        var offset = 0
+        guard let token = payload.readUInt32(at: offset) else {
+            logger.warning("[\(self.peerUsername)] ArtworkReply: missing token")
+            return
+        }
+        offset += 4
+        // Remaining bytes are the image data
+        let imageData = payload.count > offset ? Data(payload[offset...]) : Data()
+        logger.info("[\(self.peerUsername)] ArtworkReply: token=\(token) imageSize=\(imageData.count)")
+        eventContinuation.yield(.artworkReply(token: token, imageData: imageData))
+    }
+
+    // MARK: - Standard Peer Message Handlers
+
+    private func handleSharesReply(_ data: Data) async {
+        logger.debug("[\(self.peerInfo.username)] handleSharesReply called with \(data.count) bytes")
+
+        // Shares are zlib compressed per protocol spec.
+        let decompressed: Data
+        do {
+            decompressed = try ZlibDecompression.decompress(data)
+            logger.debug("[\(self.peerInfo.username)] Decompressed shares: \(data.count) -> \(decompressed.count) bytes")
+        } catch {
+            logger.error("[\(self.peerInfo.username)] Failed to decompress shares: \(error)")
+            eventContinuation.yield(.sharesReceived([]))
+            return
+        }
+
+        guard let info = MessageParser.parseSharesReply(decompressed) else {
+            logger.error("[\(self.peerInfo.username)] Failed to parse SharesReply")
+            eventContinuation.yield(.sharesReceived([]))
+            return
+        }
+
+        let files = info.files.map {
+            SharedFile(
+                filename: $0.filename,
+                size: $0.size,
+                bitrate: $0.bitrate,
+                duration: $0.duration,
+                isPrivate: $0.isPrivate
+            )
+        }
+
+        logger.info("Received \(files.count) shared files from \(self.peerInfo.username)")
+        eventContinuation.yield(.sharesReceived(files))
+    }
+
+    private func handleSearchReply(_ data: Data) async {
+        logger.debug("[\(self.peerInfo.username)] handleSearchReply called with \(data.count) bytes")
+
+        // Search replies may be zlib compressed - try decompression first.
+        // If decompressed bytes do not parse, fall back to raw payload parsing.
+        var candidatePayloads: [(data: Data, wasCompressed: Bool)] = [(data, false)]
+        if data.count > 4 {
+            do {
+                let decompressed = try ZlibDecompression.decompress(data)
+                logger.debug("[\(self.peerInfo.username)] Decompressed search reply from \(data.count) to \(decompressed.count) bytes")
+                candidatePayloads.insert((decompressed, true), at: 0)
+            } catch {
+                logger.debug("[\(self.peerInfo.username)] Not compressed or decompression failed: \(error)")
+            }
+        }
+
+        var parsedInfo: MessageParser.SearchReplyInfo?
+        var parsedFromCompressed = false
+        for candidate in candidatePayloads {
+            logger.debug("[\(self.peerInfo.username)] Parsing data (compressed=\(candidate.wasCompressed))")
+            if let parsed = MessageParser.parseSearchReply(candidate.data) {
+                parsedInfo = parsed
+                parsedFromCompressed = candidate.wasCompressed
+                break
+            }
+        }
+
+        guard let parsed = parsedInfo else {
+            logger.error("[\(self.peerInfo.username)] Failed to parse search reply!")
+            #if DEBUG
+            let dataPreview = data.prefix(50).map { String(format: "%02x", $0) }.joined(separator: " ")
+            logger.debug("[\(self.peerInfo.username)] Data starts with: \(dataPreview)")
+            #endif
+            return
+        }
+
+        logger.debug("[\(self.peerInfo.username)] Search reply parse succeeded (compressed=\(parsedFromCompressed))")
+
+        let results = parsed.files.map { file in
+            SearchResult(
+                username: parsed.username.isEmpty ? peerUsername : parsed.username,
+                filename: file.filename,
+                size: file.size,
+                bitrate: file.attributes.first { $0.type == 0 }?.value,
+                duration: file.attributes.first { $0.type == 1 }?.value,
+                sampleRate: file.attributes.first { $0.type == 4 }?.value,
+                bitDepth: file.attributes.first { $0.type == 5 }?.value,
+                freeSlots: parsed.freeSlots,
+                uploadSpeed: parsed.uploadSpeed,
+                queueLength: parsed.queueLength,
+                isPrivate: file.isPrivate
+            )
+        }
+
+        let username = parsed.username.isEmpty ? peerUsername : parsed.username
+        logger.info("[\(self.peerInfo.username)] Parsed \(results.count) search results from \(username) for token \(parsed.token)")
+        logger.info("Parsed \(results.count) search results from \(username) for token \(parsed.token)")
+
+        logger.debug("[\(self.peerInfo.username)] Yielding search reply event for token \(parsed.token)...")
+        eventContinuation.yield(.searchReply(token: parsed.token, results: results))
+        logger.info("Search results event yielded for token \(parsed.token)")
+    }
+
+    private func handleUserInfoReply(_ data: Data) async {
+        guard let info = MessageParser.parseUserInfoReply(data) else {
+            logger.error("[\(self.peerInfo.username)] Failed to parse UserInfoReply (\(data.count) bytes)")
+            return
+        }
+        logger.info("[\(self.peerInfo.username)] UserInfoReply: desc=\(info.description.count)B picture=\(info.pictureData?.count ?? 0)B uploads=\(info.totalUploads) queue=\(info.queueSize) freeSlots=\(info.hasFreeSlots)")
+        eventContinuation.yield(.userInfoReply(info))
+    }
+
+    private func handleTransferRequest(_ data: Data) async {
+        guard let parsed = MessageParser.parseTransferRequest(data) else {
+            logger.error("Failed to parse TransferRequest (\(data.count) bytes)")
+            #if DEBUG
+            let hexDump = data.prefix(50).map { String(format: "%02x", $0) }.joined(separator: " ")
+            logger.debug("TransferRequest data: \(hexDump)")
+            #endif
+            return
+        }
+
+        let fileSize = parsed.fileSize ?? 0
+        if fileSize == 0 && parsed.direction == .upload {
+            logger.warning("TransferRequest has zero file size - this may cause issues")
+            logger.warning("TransferRequest: direction=\(String(describing: parsed.direction)) token=\(parsed.token) filename=\(parsed.filename) size=\(fileSize) (WARNING: zero size!)")
+        } else {
+            logger.info("TransferRequest: direction=\(String(describing: parsed.direction)) token=\(parsed.token) filename=\(parsed.filename) size=\(fileSize)")
+        }
+
+        let request = TransferRequest(
+            direction: parsed.direction,
+            token: parsed.token,
+            filename: parsed.filename,
+            size: fileSize,
+            username: peerInfo.username
+        )
+
+        logger.debug("Yielding TransferRequest event for token \(parsed.token)")
+        eventContinuation.yield(.transferRequest(request))
+    }
+
+    private func handleTransferReply(_ data: Data) async {
+        guard let info = MessageParser.parseTransferReply(data) else {
+            logger.error("Failed to parse TransferReply")
+            return
+        }
+        if info.allowed {
+            logger.info("TransferResponse: token=\(info.token) allowed=true size=\(info.fileSize ?? 0)")
+        } else {
+            logger.info("TransferResponse: token=\(info.token) allowed=false reason=\(info.reason ?? "-")")
+        }
+        eventContinuation.yield(.transferResponse(
+            token: info.token,
+            allowed: info.allowed,
+            filesize: info.fileSize,
+            reason: info.reason
+        ))
+    }
+
+    private func handleQueueDownload(_ data: Data) async {
+        guard let (filename, _) = data.readString(at: 0) else { return }
+        // Use peerInfo.username as fallback - peerUsername is only set when receiving PeerInit,
+        // but on outgoing connections the peer may send messages before their PeerInit
+        let username = self.peerUsername.isEmpty ? self.peerInfo.username : self.peerUsername
+        logger.info("QueueUpload received from \(username): \(filename)")
+        eventContinuation.yield(.queueUpload(username: username, filename: filename))
+    }
+
+    private func handlePlaceInQueue(_ data: Data) async {
+        guard let (filename, len) = data.readString(at: 0) else { return }
+        guard let place = data.readUInt32(at: len) else { return }
+        logger.info("Queue position for \(filename): \(place)")
+        eventContinuation.yield(.placeInQueueReply(filename: filename, position: place))
+    }
+
+    private func handleUploadFailed(_ data: Data) async {
+        guard let (filename, _) = data.readString(at: 0) else { return }
+        let username = self.peerUsername.isEmpty ? self.peerInfo.username : self.peerUsername
+        logger.warning("UploadFailed from \(username): \(filename)")
+        eventContinuation.yield(.uploadFailed(username: username, filename: filename))
+    }
+
+    private func handleUploadDenied(_ data: Data) async {
+        guard let (filename, filenameLen) = data.readString(at: 0) else { return }
+        let reason = data.readString(at: filenameLen)?.string ?? "Unknown reason"
+        let username = self.peerUsername.isEmpty ? self.peerInfo.username : self.peerUsername
+        logger.warning("UploadDenied from \(username) for \(filename): \(reason)")
+        logger.warning("UploadDenied: \(filename) - \(reason)")
+        eventContinuation.yield(.uploadDenied(username: username, filename: filename, reason: reason))
+    }
+
+    private func handleFolderContentsRequest(_ data: Data) async {
+        var offset = 0
+
+        guard let token = data.readUInt32(at: offset) else { return }
+        offset += 4
+
+        guard let (folder, _) = data.readString(at: offset) else { return }
+
+        logger.info("Folder contents request: \(folder) token=\(token)")
+        logger.info("FolderContentsRequest: \(folder) token=\(token)")
+        eventContinuation.yield(.folderContentsRequest(token: token, folder: folder))
+    }
+
+    private func handlePlaceInQueueRequest(_ data: Data) async {
+        guard let (filename, _) = data.readString(at: 0) else { return }
+        let username = self.peerUsername.isEmpty ? self.peerInfo.username : self.peerUsername
+        logger.info("PlaceInQueueRequest for: \(filename) from \(username)")
+        eventContinuation.yield(.placeInQueueRequest(username: username, filename: filename))
+    }
+
+    private func handleFolderContentsReply(_ data: Data) async {
+        // Folder contents are zlib compressed
+        guard let decompressed = try? ZlibDecompression.decompress(data) else {
+            logger.error("Failed to decompress folder contents")
+            return
+        }
+
+        guard let info = MessageParser.parseFolderContentsReply(decompressed) else {
+            logger.error("Failed to parse FolderContentsReply")
+            return
+        }
+
+        let files = info.files.map {
+            SharedFile(
+                filename: $0.filename,
+                size: $0.size,
+                bitrate: $0.bitrate,
+                duration: $0.duration
+            )
+        }
+
+        logger.info("FolderContentsReply: \(info.folder) with \(files.count) files")
+        eventContinuation.yield(.folderContentsResponse(token: info.token, folder: info.folder, files: files))
+    }
+
+    private func updateState(_ newState: State) {
+        state = newState
+        eventContinuation.yield(.stateChanged(newState))
+    }
+
+    /// One-hop snapshot of the wire-level traffic counters, for the pool's
+    /// stats refresh (two separate property reads would cost two actor hops).
+    var trafficSnapshot: (bytesReceived: UInt64, bytesSent: UInt64) {
+        (bytesReceived, bytesSent)
+    }
+
+    private func recordSent(_ bytes: Int) {
+        bytesSent += UInt64(bytes)
+        messagesSent += 1
+        touchLastActivity()
+    }
+
+    private func recordReceived(_ bytes: Int) {
+        bytesReceived += UInt64(bytes)
+        touchLastActivity()
+    }
+
+}
+
+// MARK: - Types
+
+public struct TransferRequest: Sendable {
+    public let direction: FileTransferDirection
+    public let token: UInt32
+    public let filename: String
+    public let size: UInt64
+    public let username: String
+}
+
+public enum PeerError: Error, LocalizedError {
+    case notConnected
+    case connectionClosed
+    case handshakeFailed
+    case decompressionFailed
+    case timeout
+    case invalidPort
+    case malformedOutboundMessage
+    case capabilityNotAdvertised(ExtendedClientInfoCode)
+
+    public var errorDescription: String? {
+        switch self {
+        case .notConnected: return "Not connected to peer"
+        case .connectionClosed: return "Connection closed"
+        case .handshakeFailed: return "Handshake failed"
+        case .decompressionFailed: return "Failed to decompress data"
+        case .timeout: return "Connection timed out"
+        case .invalidPort: return "Invalid port number"
+        case .malformedOutboundMessage: return "Outbound message is malformed"
+        case .capabilityNotAdvertised(let code): return "Peer has not advertised \(code.wireName)"
+        }
+    }
+}

@@ -1,0 +1,84 @@
+import Foundation
+
+/// A user joined or left a room. Kept out of the message transcript so
+/// the UI can show these events in an activity pane.
+public struct RoomEvent: Identifiable, Hashable, Sendable {
+    public enum Kind: Hashable, Sendable {
+        case joined
+        case left
+    }
+
+    public let id: UUID
+    public let kind: Kind
+    public let username: String
+    public let timestamp: Date
+
+    public init(id: UUID = UUID(), kind: Kind, username: String, timestamp: Date = Date()) {
+        self.id = id
+        self.kind = kind
+        self.username = username
+        self.timestamp = timestamp
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    public var formattedTime: String {
+        Self.timeFormatter.string(from: timestamp)
+    }
+}
+
+public struct ChatRoom: Identifiable, Hashable, Sendable {
+    public let id: String
+    public let name: String
+    public var users: [String]
+    public var messages: [ChatMessage]
+    public var events: [RoomEvent]
+    public var unreadCount: Int
+    public var isJoined: Bool
+    public var isPrivate: Bool
+    public var owner: String?
+    public var operators: Set<String>
+    public var members: [String]
+    public var tickers: [String: String]
+
+    /// `tickers` is a Dictionary, so an unsorted iteration reshuffles rows on
+    /// every render. Every ticker list renders through this.
+    public var sortedTickers: [(key: String, value: String)] {
+        tickers.sorted { $0.key < $1.key }
+    }
+
+    public init(
+        name: String,
+        users: [String] = [],
+        messages: [ChatMessage] = [],
+        events: [RoomEvent] = [],
+        unreadCount: Int = 0,
+        isJoined: Bool = false,
+        isPrivate: Bool = false,
+        owner: String? = nil,
+        operators: Set<String> = [],
+        members: [String] = [],
+        tickers: [String: String] = [:]
+    ) {
+        self.id = name
+        self.name = name
+        self.users = users
+        self.messages = messages
+        self.events = events
+        self.unreadCount = unreadCount
+        self.isJoined = isJoined
+        self.isPrivate = isPrivate
+        self.owner = owner
+        self.operators = operators
+        self.members = members
+        self.tickers = tickers
+    }
+
+    public var userCount: Int {
+        users.count
+    }
+}
