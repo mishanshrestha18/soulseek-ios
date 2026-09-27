@@ -7,7 +7,7 @@ struct SearchView: View {
     @State private var text = ""
     @State private var filter = SearchFilter()
     @State private var sort = SearchSort.relevance
-    @State private var groupByFolder = true
+    @State private var groupByFolder = false
     @State private var showingFilters = false
     @State private var showingFields = false
     @State private var queueTaps = 0
@@ -61,7 +61,11 @@ struct SearchView: View {
                 }
             }
             .navigationTitle("Search")
-            .searchable(text: $text, prompt: "Artist album track")
+            .searchable(
+                text: $text,
+                placement: .navigationBarDrawer(displayMode: .always),
+                prompt: "Artist album track"
+            )
             .onSubmit(of: .search) {
                 Task { await session.search(text) }
             }
@@ -331,6 +335,11 @@ struct SearchResultRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
+            // Leading, so the state of every row reads down a single column
+            // instead of against a ragged right edge of varying name lengths.
+            statusIcon
+                .frame(width: 32)
+
             VStack(alignment: .leading, spacing: 4) {
                 Text(result.displayFilename)
                     .lineLimit(2)
@@ -369,8 +378,6 @@ struct SearchResultRow: View {
             }
 
             Spacer(minLength: 0)
-
-            statusIcon
         }
         .padding(.vertical, 2)
     }

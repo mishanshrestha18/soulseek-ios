@@ -48,10 +48,14 @@ struct StatusView: View {
                         "Blocklist received",
                         value: session.receivedExcludedPhrases ? "Yes" : "Not yet"
                     )
-                    LabeledContent(
-                        "Blocked phrases",
-                        value: "\(session.excludedPhrases.count)"
-                    )
+                    NavigationLink {
+                        BlocklistView()
+                    } label: {
+                        LabeledContent(
+                            "Blocked phrases",
+                            value: "\(session.excludedPhrases.count)"
+                        )
+                    }
                 } header: {
                     Text("Search network")
                 } footer: {

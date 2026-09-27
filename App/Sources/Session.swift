@@ -67,9 +67,14 @@ final class Session {
     private let downloadManager = DownloadManager()
 
     /// Results arrive asynchronously from many peers and are matched to the
-    /// search that asked for them by token. Late results from a previous
-    /// search are dropped rather than mixed into the current list.
-    private var activeToken: UInt32?
+    /// search that asked for them by token, so results from a previous search
+    /// are dropped rather than mixed into the current list.
+    ///
+    /// Every token belonging to the current query. A retry adds a token rather
+    /// than replacing one, because replies to the first flood keep arriving
+    /// after the second is sent — discarding them would throw away the very
+    /// results the retry was meant to find.
+    private var activeTokens: Set<UInt32> = []
 
     /// Nothing in the protocol says "that search is over" — replies simply stop
     /// arriving. Without a deadline the spinner runs forever on a query nobody
@@ -190,7 +195,7 @@ final class Session {
     func disconnect() async {
         await client.disconnectAsync()
         results = []
-        activeToken = nil
+        activeTokens.removeAll()
         isSearching = false
     }
 
@@ -206,7 +211,7 @@ final class Session {
         // Zero is a valid token but is used as a sentinel by enough clients
         // that it is worth avoiding.
         let token = UInt32.random(in: 1...UInt32.max)
-        activeToken = token
+        activeTokens = [token]
         query = normalized
         results = []
         searchReplyCount = 0
@@ -229,13 +234,12 @@ final class Session {
 
     /// Re-issues the current query under a fresh token. A new token means a new
     /// flood through the distributed network, reaching peers the first pass
-    /// missed; late replies to the old token are ignored because `activeToken`
-    /// has moved on.
+    /// missed. The earlier token stays live so its replies still count.
     private func retrySearch() async {
         guard !query.isEmpty, isConnected else { return }
         searchRetried = true
         let token = UInt32.random(in: 1...UInt32.max)
-        activeToken = token
+        activeTokens.insert(token)
         await send(query, token: token)
     }
 
@@ -269,7 +273,7 @@ final class Session {
         searchDeadline?.cancel()
         searchDeadline = Task { [weak self] in
             try? await Task.sleep(for: Self.searchRetryDelay)
-            guard !Task.isCancelled, let self, self.activeToken == token else { return }
+            guard !Task.isCancelled, let self, self.activeTokens.contains(token) else { return }
 
             // Nothing at all after the first pass: try a second flood before
             // telling the user the network had no answer.
@@ -279,7 +283,7 @@ final class Session {
             }
 
             try? await Task.sleep(for: Self.searchTimeout - Self.searchRetryDelay)
-            guard !Task.isCancelled, self.activeToken == token else { return }
+            guard !Task.isCancelled, self.activeTokens.contains(token) else { return }
             self.isSearching = false
         }
     }
@@ -287,7 +291,7 @@ final class Session {
     func clearSearch() {
         searchDeadline?.cancel()
         searchDeadline = nil
-        activeToken = nil
+        activeTokens.removeAll()
         results = []
         query = ""
         isSearching = false
@@ -359,7 +363,7 @@ final class Session {
                 guard let self else { break }
                 switch event {
                 case .results(let token, let incoming):
-                    guard token == self.activeToken else { continue }
+                    guard self.activeTokens.contains(token) else { continue }
                     self.searchReplyCount += 1
                     self.isSearching = false
                     self.results.append(contentsOf: incoming)
