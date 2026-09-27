@@ -193,7 +193,7 @@ struct BidirectionalTests {
         let peer = PeerConnection(peerInfo: peerInfo, token: 12345)
 
         // Consume events
-        Task {
+        let consumer = Task {
             for await event in peer.events {
                 if case .searchReply(let token, let results) = event {
                     print("✅ Event received! token=\(token), results=\(results.count)")
@@ -201,6 +201,14 @@ struct BidirectionalTests {
                 }
             }
         }
+        defer { consumer.cancel() }
+
+        // Park the consumer in `for await` before connecting. The server sends
+        // its SearchReply 100ms after its side goes ready, and the AsyncStream
+        // buffer that should cover yields made before iteration starts does not
+        // land reliably here — the same effect ShareCountNotificationTests
+        // documents and primes around.
+        try? await Task.sleep(for: .milliseconds(50))
 
         try await peer.connect()
         print("✅ Connected")
