@@ -27,6 +27,16 @@ final class Session {
     private(set) var isSearching = false
     private(set) var query = ""
 
+    /// Something the user should know about the search they just ran — that it
+    /// was rewritten, or that the network refuses to carry it.
+    private(set) var searchNotice: String?
+
+    /// Phrases the server says are not allowed on the search network. Peers are
+    /// required to leave matching paths out of their replies, so a query
+    /// containing one comes back empty no matter how common the music is. The
+    /// server pushes this list after login; until it arrives the list is empty.
+    private(set) var excludedPhrases: [String] = []
+
     let client = NetworkClient()
     let transfers = TransferStore()
     let statistics = StatisticsStore()
@@ -43,6 +53,12 @@ final class Session {
     /// search that asked for them by token. Late results from a previous
     /// search are dropped rather than mixed into the current list.
     private var activeToken: UInt32?
+
+    /// Nothing in the protocol says "that search is over" — replies simply stop
+    /// arriving. Without a deadline the spinner runs forever on a query nobody
+    /// answers, which reads as the app being stuck.
+    private var searchDeadline: Task<Void, Never>?
+    static let searchTimeout = Duration.seconds(20)
 
     init() {
         observeConnection()
@@ -164,30 +180,70 @@ final class Session {
     // MARK: - Search
 
     func search(_ text: String) async {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, isConnected else { return }
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Peers match terms against the file path, so punctuation the user typed
+        // as a separator has to go or it becomes a term nothing can satisfy.
+        let normalized = SearchQueryBuilder.normalize(raw)
+        guard !normalized.isEmpty, isConnected else { return }
 
         // Zero is a valid token but is used as a sentinel by enough clients
         // that it is worth avoiding.
         let token = UInt32.random(in: 1...UInt32.max)
         activeToken = token
-        query = trimmed
+        query = normalized
         results = []
         isSearching = true
+        searchNotice = notice(raw: raw, normalized: normalized)
 
         do {
-            try await client.search(query: trimmed, token: token)
+            try await client.search(query: normalized, token: token)
+            startSearchDeadline(for: token)
         } catch {
             isSearching = false
             lastError = error.localizedDescription
         }
     }
 
+    /// Explains anything surprising about this search before the user waits
+    /// twenty seconds for nothing.
+    private func notice(raw: String, normalized: String) -> String? {
+        if let phrase = blockedPhrase(in: normalized) {
+            return "The server does not allow \"\(phrase)\" on the search "
+                + "network, so peers will not answer this query. Try different "
+                + "wording."
+        }
+        if normalized != raw {
+            return "Searching for \(normalized) — punctuation is removed "
+                + "because peers match each word against the file's folder path."
+        }
+        return nil
+    }
+
+    /// The first excluded phrase this query contains, if any.
+    func blockedPhrase(in query: String) -> String? {
+        let haystack = query.lowercased()
+        return excludedPhrases.first { phrase in
+            !phrase.isEmpty && haystack.contains(phrase.lowercased())
+        }
+    }
+
+    private func startSearchDeadline(for token: UInt32) {
+        searchDeadline?.cancel()
+        searchDeadline = Task { [weak self] in
+            try? await Task.sleep(for: Self.searchTimeout)
+            guard !Task.isCancelled, let self, self.activeToken == token else { return }
+            self.isSearching = false
+        }
+    }
+
     func clearSearch() {
+        searchDeadline?.cancel()
+        searchDeadline = nil
         activeToken = nil
         results = []
         query = ""
         isSearching = false
+        searchNotice = nil
     }
 
     // MARK: - Downloads
@@ -197,6 +253,15 @@ final class Session {
     /// appears in `transfers.downloads` straight away either way.
     func download(_ result: SearchResult) async {
         await downloadManager.queueDownload(from: result)
+    }
+
+    /// Queues every file in a folder. The protocol has no "download folder"
+    /// message — the desktop client does the same thing, one QueueUpload per
+    /// file, and each lands in that peer's queue independently.
+    func downloadAll(_ results: [SearchResult]) async {
+        for result in results {
+            await downloadManager.queueDownload(from: result)
+        }
     }
 
     func cancelDownload(_ id: UUID) async {
@@ -244,10 +309,19 @@ final class Session {
         Task { [weak self] in
             for await event in channel.subscribe(bufferingPolicy: .bufferingOldest(4096)) {
                 guard let self else { break }
-                guard case .results(let token, let incoming) = event else { continue }
-                guard token == self.activeToken else { continue }
-                self.isSearching = false
-                self.results.append(contentsOf: incoming)
+                switch event {
+                case .results(let token, let incoming):
+                    guard token == self.activeToken else { continue }
+                    self.isSearching = false
+                    self.results.append(contentsOf: incoming)
+                case .excludedPhrases(let phrases):
+                    // Pushed once after login. Kept so a query that the network
+                    // refuses to carry can be named as such instead of just
+                    // returning nothing.
+                    self.excludedPhrases = phrases
+                case .wishlistInterval, .folderContentsResponse:
+                    continue
+                }
             }
         }
     }

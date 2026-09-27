@@ -10,12 +10,21 @@ import SwiftUI
 struct SearchFiltersSheet: View {
     @Binding var filter: SearchFilter
     @Binding var sort: SearchSort
+    @Binding var groupByFolder: Bool
 
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Toggle("Group by folder", isOn: $groupByFolder)
+                } header: {
+                    Text("Layout")
+                } footer: {
+                    Text("Peers share whole directories, so grouping collapses an album into one row and lets you queue all of it at once.")
+                }
+
                 Section {
                     Toggle("Lossless only", isOn: $filter.losslessOnly)
 

@@ -7,7 +7,9 @@ struct SearchView: View {
     @State private var text = ""
     @State private var filter = SearchFilter()
     @State private var sort = SearchSort.relevance
+    @State private var groupByFolder = true
     @State private var showingFilters = false
+    @State private var showingFields = false
     @State private var queueTaps = 0
 
     /// Extensions actually present in the current results, with counts, so the
@@ -23,48 +25,67 @@ struct SearchView: View {
         sort.apply(to: filter.apply(to: session.results))
     }
 
+    private var folders: [ResultFolder] {
+        ResultFolder.group(visibleResults)
+    }
+
     var body: some View {
         NavigationStack {
             Group {
                 if visibleResults.isEmpty {
                     emptyState
+                } else if groupByFolder {
+                    List {
+                        ForEach(folders) { folder in
+                            FolderRow(folder: folder, onQueue: queue, onQueueAll: queueAll)
+                        }
+                    }
+                    .listStyle(.plain)
                 } else {
                     List {
                         ForEach(visibleResults) { result in
-                            Button {
-                                queue(result)
-                            } label: {
-                                SearchResultRow(
-                                    result: result,
-                                    status: session.transfers.downloadStatus(
-                                        username: result.username,
-                                        filename: result.filename
-                                    )
-                                )
-                            }
-                            .buttonStyle(.plain)
+                            resultButton(result)
                         }
                     }
                     .listStyle(.plain)
                 }
             }
             .safeAreaInset(edge: .top) {
-                if !session.results.isEmpty {
-                    filterBar
+                VStack(spacing: 0) {
+                    if let notice = session.searchNotice {
+                        NoticeBanner(text: notice)
+                    }
+                    if !session.results.isEmpty {
+                        filterBar
+                    }
                 }
             }
             .navigationTitle("Search")
-            .searchable(text: $text, prompt: "Artist, album, track")
+            .searchable(text: $text, prompt: "Artist album track")
             .onSubmit(of: .search) {
                 Task { await session.search(text) }
             }
             .toolbar {
-                if session.isSearching {
-                    ToolbarItem(placement: .topBarTrailing) { ProgressView() }
+                ToolbarItem(placement: .topBarTrailing) {
+                    if session.isSearching {
+                        ProgressView()
+                    } else {
+                        Button {
+                            showingFields = true
+                        } label: {
+                            Image(systemName: "slider.horizontal.3")
+                        }
+                    }
                 }
             }
             .sheet(isPresented: $showingFilters) {
-                SearchFiltersSheet(filter: $filter, sort: $sort)
+                SearchFiltersSheet(filter: $filter, sort: $sort, groupByFolder: $groupByFolder)
+            }
+            .sheet(isPresented: $showingFields) {
+                GuidedSearchSheet { built in
+                    text = built
+                    Task { await session.search(built) }
+                }
             }
             // Tapping only queues the file with the peer, so without this the
             // tap has no perceptible effect until the peer decides to answer.
@@ -72,9 +93,29 @@ struct SearchView: View {
         }
     }
 
+    private func resultButton(_ result: SearchResult) -> some View {
+        Button {
+            queue(result)
+        } label: {
+            SearchResultRow(
+                result: result,
+                status: session.transfers.downloadStatus(
+                    username: result.username,
+                    filename: result.filename
+                )
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
     private func queue(_ result: SearchResult) {
         queueTaps += 1
         Task { await session.download(result) }
+    }
+
+    private func queueAll(_ folder: ResultFolder) {
+        queueTaps += 1
+        Task { await session.downloadAll(folder.files) }
     }
 
     @ViewBuilder
@@ -103,13 +144,19 @@ struct SearchView: View {
                     FilterChip(title: "Free slot", isOn: filter.freeSlotsOnly) {
                         filter.freeSlotsOnly.toggle()
                     }
+
+                    FilterChip(title: "Folders", isOn: groupByFolder) {
+                        groupByFolder.toggle()
+                    }
                 }
                 .padding(.horizontal)
             }
             .scrollIndicators(.hidden)
 
             HStack {
-                Text("\(visibleResults.count) of \(session.results.count)")
+                Text(groupByFolder
+                     ? "\(folders.count) folders, \(visibleResults.count) files"
+                     : "\(visibleResults.count) of \(session.results.count)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -145,7 +192,9 @@ struct SearchView: View {
             ContentUnavailableView {
                 Label("Search Soulseek", systemImage: "magnifyingglass")
             } description: {
-                Text("Search the network for music shared by other users.")
+                Text("Peers match every word against the file's folder path, so artist, album and track together works best.")
+            } actions: {
+                Button("Search by artist and album") { showingFields = true }
             }
         } else if !session.results.isEmpty {
             ContentUnavailableView {
@@ -156,8 +205,104 @@ struct SearchView: View {
                 Button("Clear filters") { filter = SearchFilter() }
             }
         } else {
-            ContentUnavailableView.search(text: session.query)
+            ContentUnavailableView {
+                Label("No results", systemImage: "magnifyingglass")
+            } description: {
+                Text("No peer answered for \(session.query). Fewer, more distinctive words usually work better — try the artist and album without the track name.")
+            } actions: {
+                Button("Search by artist and album") { showingFields = true }
+            }
         }
+    }
+}
+
+// MARK: - Folder row
+
+private struct FolderRow: View {
+    let folder: ResultFolder
+    let onQueue: (SearchResult) -> Void
+    let onQueueAll: (ResultFolder) -> Void
+
+    @Environment(Session.self) private var session
+
+    var body: some View {
+        DisclosureGroup {
+            ForEach(folder.files) { file in
+                Button {
+                    onQueue(file)
+                } label: {
+                    SearchResultRow(
+                        result: file,
+                        status: session.transfers.downloadStatus(
+                            username: file.username,
+                            filename: file.filename
+                        )
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        } label: {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(folder.displayName)
+                        .lineLimit(2)
+
+                    HStack(spacing: 6) {
+                        Text(folder.username)
+                        Text("-")
+                        Text("\(folder.fileCount) files")
+                        Text("-")
+                        Text(folder.formattedSize)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                    HStack(spacing: 6) {
+                        Label(
+                            folder.freeSlots ? "Free slot" : "Queued (\(folder.queueLength))",
+                            systemImage: folder.freeSlots ? "bolt.fill" : "clock"
+                        )
+                        .foregroundStyle(folder.freeSlots ? Color.green : Color.secondary)
+
+                        if !folder.types.isEmpty {
+                            Text(folder.types.prefix(3).map { $0.uppercased() }.joined(separator: " "))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.caption2)
+                }
+
+                Spacer(minLength: 0)
+
+                Button {
+                    onQueueAll(folder)
+                } label: {
+                    Image(systemName: "square.and.arrow.down.on.square")
+                        .imageScale(.large)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tint)
+                // Without this the disclosure arrow swallows the tap.
+                .contentShape(Rectangle())
+            }
+            .padding(.vertical, 2)
+        }
+    }
+}
+
+// MARK: - Small pieces
+
+private struct NoticeBanner: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .background(Color.yellow.opacity(0.2))
     }
 }
 

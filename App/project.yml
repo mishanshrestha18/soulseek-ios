@@ -53,6 +53,11 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # Playback of a finished download continues with the screen locked.
+        # Only claimed because the app really does play audio; iOS terminates
+        # apps that declare this and then produce none.
+        UIBackgroundModes:
+          - audio
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.soulseek.app
