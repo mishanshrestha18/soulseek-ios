@@ -1,11 +1,40 @@
 import Testing
 import Foundation
 import Network
+import Synchronization
 @testable import SeeleseekCore
 
 /// Tests to verify bidirectional TCP communication works
 @Suite("Bidirectional TCP Communication", .serialized)
 struct BidirectionalTests {
+
+    /// Starts `listener` and returns its port once it is actually bound.
+    ///
+    /// Reading `NWListener.port` after a fixed sleep is not safe: before the
+    /// listener reaches `.ready` the property is `Port(rawValue: 0)` rather
+    /// than nil, so `guard let` accepts it and the zero travels onward as a
+    /// real port. On the iOS simulator — roughly 13x slower than the macOS
+    /// host — 100ms was not enough, and the zero surfaced as
+    /// `PeerError.invalidPort` from PeerConnection. Every other test file in
+    /// this target already waits for `.ready`; this matches them.
+    private func startAndAwaitPort(_ listener: NWListener) async -> NWEndpoint.Port {
+        await withCheckedContinuation { (continuation: CheckedContinuation<NWEndpoint.Port, Never>) in
+            // `.ready` should only arrive once, but resuming a checked
+            // continuation twice traps, and a CI crash is worse than a lock.
+            let resumed = Mutex(false)
+            listener.stateUpdateHandler = { state in
+                guard case .ready = state, let port = listener.port else { return }
+                let isFirst = resumed.withLock { already -> Bool in
+                    if already { return false }
+                    already = true
+                    return true
+                }
+                if isFirst { continuation.resume(returning: port) }
+            }
+            listener.start(queue: .global())
+        }
+    }
+
 
     /// Test raw NWConnection bidirectional communication (no PeerConnection)
     @Test("Raw bidirectional NWConnection communication")
@@ -54,13 +83,7 @@ struct BidirectionalTests {
             print("🔵 Server listener state: \(state)")
         }
 
-        listener.start(queue: .global())
-        try await Task.sleep(for: .milliseconds(100))
-
-        // Get the assigned port
-        guard let port = listener.port else {
-            throw TestError.noPort
-        }
+        let port = await startAndAwaitPort(listener)
 
         // Create client connection
         let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: port)
@@ -163,12 +186,7 @@ struct BidirectionalTests {
             }
         }
 
-        listener.start(queue: .global())
-        try await Task.sleep(for: .milliseconds(100))
-
-        guard let port = listener.port else {
-            throw TestError.noPort
-        }
+        let port = await startAndAwaitPort(listener)
 
         // Create PeerConnection
         let peerInfo = PeerConnection.PeerInfo(username: "testserver", ip: "127.0.0.1", port: Int(port.rawValue))
@@ -237,12 +255,7 @@ struct BidirectionalTests {
             }
         }
 
-        listener.start(queue: .global())
-        try await Task.sleep(for: .milliseconds(200))
-
-        guard let port = listener.port else {
-            throw TestError.noPort
-        }
+        let port = await startAndAwaitPort(listener)
 
         let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: port)
         let peerConn = NWConnection(to: endpoint, using: .tcp)
@@ -344,16 +357,7 @@ struct BidirectionalTests {
             }
         }
 
-        listener.stateUpdateHandler = { listenerState in
-            print("🔊 Listener: \(listenerState)")
-        }
-
-        listener.start(queue: .global())
-        try await Task.sleep(for: .milliseconds(200))
-
-        guard let port = listener.port else {
-            throw TestError.noPort
-        }
+        let port = await startAndAwaitPort(listener)
 
         // Connect from "peer"
         let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: port)

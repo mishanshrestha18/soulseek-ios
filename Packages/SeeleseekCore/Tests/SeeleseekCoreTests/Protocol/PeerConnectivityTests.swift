@@ -8,15 +8,6 @@ import Foundation
 ///  - multi-waiter getPeerAddress coalescing
 ///  - TransferRequest routing ambiguity
 ///  - outbound NWParameters construction
-// The test target defaults to MainActor isolation, but the @Test macro
-// expands its traits in a nonisolated context, so this has to opt out. An
-// immutable Bool has nothing to race on.
-#if os(iOS)
-private nonisolated(unsafe) let runningOnIOS = true
-#else
-private nonisolated(unsafe) let runningOnIOS = false
-#endif
-
 @Suite("Peer Connectivity", .serialized)
 struct PeerConnectivityTests {
 
@@ -75,16 +66,12 @@ struct PeerConnectivityTests {
         await client.disconnectAsync()
     }
 
-    // UNEXPLAINED iOS GAP. Passes on the macOS host. On the iOS simulator the
-    // client never reaches `.connected` even once against the loopback fake
-    // server, observing only [.connecting, .disconnected]. The fake server
-    // waits for `.ready` before handing back its port, so this is not the
-    // obvious bind race. Reconnect matters more on mobile than anywhere else
-    // — a phone changes networks constantly — so this needs a real diagnosis
-    // rather than staying skipped.
-    @Test("Unexpected server loss reconnects without publishing disconnected",
-          .disabled(if: runningOnIOS,
-                    "Unexplained failure on the iOS simulator; see comment"))
+    // Previously skipped on iOS: the client never reached `.connected` against
+    // the loopback fake server. That was most likely simulator contention from
+    // parallel test execution, which also made unrelated pure-logic tests time
+    // out; the simulator job is serialized now. Re-enabled to confirm, because
+    // reconnect matters more on a phone than anywhere else.
+    @Test("Unexpected server loss reconnects without publishing disconnected")
     func unexpectedServerLossReconnectsWithoutLoginFlash() async throws {
         let listener = try NWListener(using: .tcp, on: .any)
         let inboundStream = AsyncStream<NWConnection> { continuation in

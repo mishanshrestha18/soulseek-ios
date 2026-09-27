@@ -60,13 +60,18 @@ them, re-copy from `seeleseekTests/` and re-apply that deletion.
 
 ## Skipped tests
 
-Two of the ported tests do not run everywhere. Both are disabled with a trait
-rather than deleted, so they show up as skipped instead of disappearing.
+One ported test does not run everywhere. It is disabled with a trait rather
+than deleted, so it shows up as skipped instead of disappearing.
+
+The simulator job runs serialized. With parallel execution, tests across
+unrelated suites — including pure-logic ones — all hit the per-test time
+limit at once, which is contention on a single simulator rather than any one
+test being slow.
 
 | Test | Skipped on | Why |
 |------|-----------|-----|
 | `ShareCountNotificationTests` — "Rapid changes coalesce…" | CI | Five rescans must all land inside the debounce window. On shared runners they straddle it and the second trailing-edge yield is correct behaviour, so the assertion is wrong rather than the code. Scaling the waits does not help — the window itself is the problem. Fails on the macOS host too. |
-| `PeerConnectivityTests` — "Unexpected server loss reconnects…" | iOS | Unexplained. Passes on macOS. On the simulator the client never reaches `.connected` against the loopback fake server. **Needs diagnosis** — reconnect is more important on mobile than on desktop. |
+
 
 The rest of that suite proves an absence (a cancelled subscriber never fires),
 which cannot be polled for the way arrival can, so those waits are fixed
