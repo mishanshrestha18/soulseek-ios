@@ -92,6 +92,25 @@ struct StatusView: View {
                     }
                 }
 
+                if !session.history.isEmpty {
+                    Section {
+                        ForEach(session.history) { attempt in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(attempt.query)
+                                    .font(.callout)
+                                    .lineLimit(1)
+                                Text("\(attempt.replies) peers - \(attempt.files) files\(attempt.reflooded ? " - re-flooded" : "")")
+                                    .font(.caption)
+                                    .foregroundStyle(attempt.replies == 0 ? .red : .secondary)
+                            }
+                        }
+                    } header: {
+                        Text("Search history")
+                    } footer: {
+                        Text("Run several queries and compare the peer counts. A query drawing zero peers while another draws a hundred is a property of the query, not of the connection.")
+                    }
+                }
+
                 Section {
                     Button("Disconnect", role: .destructive) {
                         Task { await session.disconnect() }

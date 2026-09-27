@@ -79,6 +79,24 @@ final class Session {
 
     private(set) var connectivity = Connectivity()
 
+    /// One row per search run this session.
+    ///
+    /// Reply count is the useful column. A query that draws zero replies while
+    /// another draws a hundred is not a reachability problem, and comparing
+    /// several queries side by side is the only way to tell which property of a
+    /// query makes the network ignore it.
+    struct SearchAttempt: Identifiable, Equatable {
+        let id = UUID()
+        let query: String
+        var replies = 0
+        var files = 0
+        var reflooded = false
+        let at = Date()
+    }
+
+    private(set) var history: [SearchAttempt] = []
+    private static let historyLimit = 20
+
     let client = NetworkClient()
     let transfers = TransferStore()
     let statistics = StatisticsStore()
@@ -244,6 +262,9 @@ final class Session {
         isSearching = true
         searchNotice = notice(raw: raw, normalized: normalized)
 
+        history.insert(SearchAttempt(query: normalized), at: 0)
+        if history.count > Self.historyLimit { history.removeLast() }
+
         await send(normalized, token: token)
     }
 
@@ -263,6 +284,7 @@ final class Session {
     private func retrySearch() async {
         guard !query.isEmpty, isConnected else { return }
         searchRetried = true
+        if !history.isEmpty { history[0].reflooded = true }
         let token = UInt32.random(in: 1...UInt32.max)
         activeTokens.insert(token)
         await send(query, token: token)
@@ -405,6 +427,10 @@ final class Session {
                     self.searchReplyCount += 1
                     self.isSearching = false
                     self.results.append(contentsOf: incoming)
+                    if !self.history.isEmpty {
+                        self.history[0].replies = self.searchReplyCount
+                        self.history[0].files = self.results.count
+                    }
                 case .excludedPhrases(let phrases):
                     // Pushed once after login. Kept so a query that the network
                     // refuses to carry can be named as such instead of just
