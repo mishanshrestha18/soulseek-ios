@@ -64,6 +64,25 @@ final class TransferStore: TransferTracking {
         return nil
     }
 
+    // MARK: - Queries for the UI
+
+    /// Status of the newest download for this peer and path, or nil if the file
+    /// has never been queued. Lets a search row show that it is already
+    /// downloading — without it, tapping a result gives no visible feedback at
+    /// all, which reads as the tap having done nothing.
+    func downloadStatus(username: String, filename: String) -> Transfer.TransferStatus? {
+        guard let ids = downloadIDsByPeerFile[Self.key(username, filename)] else { return nil }
+        for id in ids.reversed() {
+            if let index = downloadPositions[id] { return downloads[index].status }
+        }
+        return nil
+    }
+
+    /// Drives the tab badge, so a queued transfer is visible from any screen.
+    var activeDownloadCount: Int {
+        downloads.filter { $0.status.isLiveDownloadAttempt }.count
+    }
+
     // MARK: - App-side mutation
 
     /// Drops settled rows and rebuilds the indexes, since positions shift.

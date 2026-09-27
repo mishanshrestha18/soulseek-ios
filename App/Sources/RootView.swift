@@ -12,6 +12,10 @@ struct RootView: View {
                         .tabItem { Label("Search", systemImage: "magnifyingglass") }
                     TransfersView()
                         .tabItem { Label("Transfers", systemImage: "arrow.down.circle") }
+                        // Queueing happens on the Search tab, so without a
+                        // badge there is nothing to tell you a transfer is in
+                        // flight until you go looking for it.
+                        .badge(session.transfers.activeDownloadCount)
                     StatusView()
                         .tabItem { Label("Status", systemImage: "network") }
                 }
