@@ -149,9 +149,11 @@ struct BidirectionalTests {
 
         listener.newConnectionHandler = { serverConn in
             print("🔵 Server: Client connected")
-            serverConn.start(queue: .global())
 
-            // Wait for connection to be ready, then send data
+            // Handler before start. Started first, the connection can reach
+            // .ready before the handler is attached, the .ready callback never
+            // fires, and the server never sends — which is how this failed on
+            // the simulator while passing on the host.
             serverConn.stateUpdateHandler = { connState in
                 print("🔵 Server conn state: \(connState)")
                 if connState == .ready {
@@ -184,6 +186,8 @@ struct BidirectionalTests {
                     }
                 }
             }
+
+            serverConn.start(queue: .global())
         }
 
         let port = await startAndAwaitPort(listener)
@@ -201,14 +205,11 @@ struct BidirectionalTests {
                 }
             }
         }
+        // `peer.events` is a stored AsyncStream whose continuation exists from
+        // init, so a late consumer still receives buffered yields — no priming
+        // needed here, unlike the streams ShareCountNotificationTests subscribes
+        // to on demand.
         defer { consumer.cancel() }
-
-        // Park the consumer in `for await` before connecting. The server sends
-        // its SearchReply 100ms after its side goes ready, and the AsyncStream
-        // buffer that should cover yields made before iteration starts does not
-        // land reliably here — the same effect ShareCountNotificationTests
-        // documents and primes around.
-        try? await Task.sleep(for: .milliseconds(50))
 
         try await peer.connect()
         print("✅ Connected")

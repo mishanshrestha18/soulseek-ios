@@ -3,6 +3,10 @@ import SwiftUI
 
 /// The constraints that do not fit in the chip row: quality floors, size floor,
 /// excluded words and sort order. Mirrors the desktop client's filter bar.
+///
+/// Sections use the `header:`/`footer:` form throughout. There is no
+/// `Section(_ title:) { } footer: { }` initializer — a title string and a
+/// footer builder cannot be combined that way.
 struct SearchFiltersSheet: View {
     @Binding var filter: SearchFilter
     @Binding var sort: SearchSort
@@ -12,7 +16,7 @@ struct SearchFiltersSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Quality") {
+                Section {
                     Toggle("Lossless only", isOn: $filter.losslessOnly)
 
                     Picker("Minimum bitrate", selection: $filter.minBitrate) {
@@ -20,41 +24,51 @@ struct SearchFiltersSheet: View {
                             Text(rate == 0 ? "Any" : "\(rate) kbps").tag(rate)
                         }
                     }
+                } header: {
+                    Text("Quality")
                 } footer: {
                     Text("A bitrate floor never hides lossless files — they report no comparable bitrate.")
                 }
 
-                Section("Availability") {
+                Section {
                     Toggle("Free slot only", isOn: $filter.freeSlotsOnly)
+                } header: {
+                    Text("Availability")
                 } footer: {
                     Text("A free slot means the transfer starts now. Everything else waits in that user's queue, sometimes for hours.")
                 }
 
-                Section("Size") {
+                Section {
                     Picker("Minimum size", selection: $filter.minSizeMB) {
                         ForEach(SearchFilter.sizeOptions, id: \.self) { size in
                             Text(size == 0 ? "Any" : "\(size) MB").tag(size)
                         }
                     }
+                } header: {
+                    Text("Size")
                 } footer: {
                     Text("Useful for excluding snippets and previews from album searches.")
                 }
 
-                Section("Exclude words") {
+                Section {
                     TextField("live remix karaoke", text: $filter.excluded)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                } header: {
+                    Text("Exclude words")
                 } footer: {
                     Text("Space separated. A result whose path contains any of these is hidden.")
                 }
 
-                Section("Sort") {
+                Section {
                     Picker("Order", selection: $sort) {
                         ForEach(SearchSort.allCases) { order in
                             Text(order.label).tag(order)
                         }
                     }
                     .pickerStyle(.segmented)
+                } header: {
+                    Text("Sort")
                 } footer: {
                     Text("Default keeps the order results arrived in, which roughly tracks which peers responded fastest.")
                 }
