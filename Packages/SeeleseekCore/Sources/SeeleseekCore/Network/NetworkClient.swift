@@ -219,6 +219,12 @@ public actor NetworkClient {
     var distributedParentConnection: PeerConnection?
     var isConnectingToParent = false
 
+    /// Whether we are attached to the distributed search tree. Read-only and
+    /// exposed for diagnostics: a client with no parent is not a participating
+    /// node, which is worth being able to see from the outside when searches
+    /// come back unanswered.
+    public var hasDistributedParent: Bool { distributedParentConnection != nil }
+
     // MARK: - Keepalive Configuration
     /// Interval between ping messages (5 minutes)
     private static let pingInterval: TimeInterval = 300

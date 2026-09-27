@@ -41,6 +41,23 @@ struct StatusView: View {
                 }
 
                 Section {
+                    LabeledContent("Listening port", value: port)
+                    LabeledContent("Local address", value: session.connectivity.localIP ?? "unknown")
+                    LabeledContent("External address", value: session.connectivity.externalIP ?? "unknown")
+                    LabeledContent("Router mapping", value: mapping)
+                    LabeledContent(
+                        "In search tree",
+                        value: session.connectivity.hasDistributedParent ? "Yes" : "No"
+                    )
+                } header: {
+                    Text("Reachability")
+                } footer: {
+                    Text(session.connectivity.inboundLikelyBlocked
+                         ? "Peers cannot open connections to this device, so every search reply has to come through the server's indirect route. A peer that is also unreachable cannot answer you at all."
+                         : "Peers can open connections to this device directly.")
+                }
+
+                Section {
                     // An empty phrase list means nothing until you know whether
                     // the server actually sent one — "nothing is blocked" and
                     // "we never received the list" look identical otherwise.
@@ -82,6 +99,19 @@ struct StatusView: View {
                 }
             }
             .navigationTitle("Status")
+            .refreshable { await session.refreshConnectivity() }
+            .task { await session.refreshConnectivity() }
         }
+    }
+
+    private var port: String {
+        let value = session.connectivity.listenPort
+        return value == 0 ? "not listening" : "\(value)"
+    }
+
+    private var mapping: String {
+        let ports = session.connectivity.mappedPorts
+        guard !ports.isEmpty else { return "none" }
+        return ports.map(String.init).joined(separator: ", ")
     }
 }

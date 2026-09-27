@@ -42,6 +42,17 @@ set aside for experimental clients, with minor version `1`.
 
 Not for upstream: 169 is correct *for* seeleseek.
 
+### `0003-diagnostics-accessor.patch`
+
+Adds a public read-only `NetworkClient.hasDistributedParent`. Search replies
+arrive by a peer opening a connection to us, so when searches come back
+unanswered the first questions are whether we are reachable and whether we are
+attached to the distributed search tree. Everything else that answers those
+(`listenPort`, `externalIP`, `localIP`, `natGateway`, `natMappings`) is already
+public; parent state was not.
+
+Worth sending upstream: it exposes existing state and changes no behaviour.
+
 ### `Package.swift`: test target isolation
 
 Not in `Patches/` since `Package.swift` is not part of the vendored Sources

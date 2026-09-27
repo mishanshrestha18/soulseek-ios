@@ -54,6 +54,31 @@ final class Session {
     private(set) var searchRetried = false
     static let searchRetryDelay = Duration.seconds(8)
 
+    /// Whether peers can reach us, and whether we are in the search tree.
+    ///
+    /// Search replies arrive by a peer opening a connection *to us*, so if we
+    /// are unreachable every reply depends on the server-brokered indirect
+    /// path. That makes reachability the first thing to check when searches go
+    /// unanswered.
+    struct Connectivity: Equatable {
+        var listenPort: UInt16 = 0
+        var externalIP: String?
+        var localIP: String?
+        var natGateway: String?
+        var mappedPorts: [UInt16] = []
+        var hasDistributedParent = false
+
+        /// A different external address with no port mapping means inbound
+        /// connections do not arrive — the normal situation on cellular, where
+        /// the carrier NAT cannot be traversed at all.
+        var inboundLikelyBlocked: Bool {
+            guard let externalIP, let localIP else { return true }
+            return externalIP != localIP && mappedPorts.isEmpty
+        }
+    }
+
+    private(set) var connectivity = Connectivity()
+
     let client = NetworkClient()
     let transfers = TransferStore()
     let statistics = StatisticsStore()
@@ -259,6 +284,19 @@ final class Session {
             return "Searching for \(normalized)"
         }
         return nil
+    }
+
+    /// Pulled on demand rather than observed: these change rarely, and the
+    /// values live on an actor whose state is not published.
+    func refreshConnectivity() async {
+        connectivity = Connectivity(
+            listenPort: await client.listenPort,
+            externalIP: await client.externalIP,
+            localIP: await client.localIP,
+            natGateway: await client.natGateway,
+            mappedPorts: await client.natMappings.map(\.externalPort),
+            hasDistributedParent: await client.hasDistributedParent
+        )
     }
 
     /// The first excluded phrase this query contains, if any.
