@@ -27,7 +27,8 @@ struct RootView: View {
     }
 }
 
-/// Connection detail, and the only place the session can be torn down.
+/// Connection detail, search diagnostics, and the only place the session can be
+/// torn down.
 struct StatusView: View {
     @Environment(Session.self) private var session
 
@@ -38,6 +39,38 @@ struct StatusView: View {
                     LabeledContent("Server", value: Session.defaultServer)
                     LabeledContent("Status", value: session.status.rawValue.capitalized)
                 }
+
+                Section {
+                    // An empty phrase list means nothing until you know whether
+                    // the server actually sent one — "nothing is blocked" and
+                    // "we never received the list" look identical otherwise.
+                    LabeledContent(
+                        "Blocklist received",
+                        value: session.receivedExcludedPhrases ? "Yes" : "Not yet"
+                    )
+                    LabeledContent(
+                        "Blocked phrases",
+                        value: "\(session.excludedPhrases.count)"
+                    )
+                } header: {
+                    Text("Search network")
+                } footer: {
+                    Text("The server publishes phrases that peers must leave out of search replies. A query containing one returns nothing regardless of how much of that music exists.")
+                }
+
+                if !session.query.isEmpty {
+                    Section {
+                        LabeledContent("Query sent", value: session.query)
+                        LabeledContent("Peers replied", value: "\(session.searchReplyCount)")
+                        LabeledContent("Files found", value: "\(session.results.count)")
+                        LabeledContent("Re-flooded", value: session.searchRetried ? "Yes" : "No")
+                    } header: {
+                        Text("Last search")
+                    } footer: {
+                        Text("Zero peers replying means the query never reached anyone who could answer — a different problem from peers replying with no matches.")
+                    }
+                }
+
                 Section {
                     Button("Disconnect", role: .destructive) {
                         Task { await session.disconnect() }

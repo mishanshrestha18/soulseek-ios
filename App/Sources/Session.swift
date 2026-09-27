@@ -37,6 +37,23 @@ final class Session {
     /// server pushes this list after login; until it arrives the list is empty.
     private(set) var excludedPhrases: [String] = []
 
+    /// Whether the server has actually sent the list. Without this an empty
+    /// list is ambiguous — it could mean nothing is blocked, or that the list
+    /// never arrived, and those call for completely different conclusions.
+    private(set) var receivedExcludedPhrases = false
+
+    /// How many peers replied to the current search, as distinct from how many
+    /// files came back. Zero replies means nothing reached us at all, which is a
+    /// different problem from peers replying with no matches.
+    private(set) var searchReplyCount = 0
+
+    /// Re-floods the query once when the first attempt draws nothing. The server
+    /// distributes a search across a subset of the network, so a second pass
+    /// reaches a different set of peers — the same reason the desktop client's
+    /// wishlist re-runs queries on an interval.
+    private(set) var searchRetried = false
+    static let searchRetryDelay = Duration.seconds(8)
+
     let client = NetworkClient()
     let transfers = TransferStore()
     let statistics = StatisticsStore()
@@ -192,9 +209,15 @@ final class Session {
         activeToken = token
         query = normalized
         results = []
+        searchReplyCount = 0
+        searchRetried = false
         isSearching = true
         searchNotice = notice(raw: raw, normalized: normalized)
 
+        await send(normalized, token: token)
+    }
+
+    private func send(_ normalized: String, token: UInt32) async {
         do {
             try await client.search(query: normalized, token: token)
             startSearchDeadline(for: token)
@@ -202,6 +225,18 @@ final class Session {
             isSearching = false
             lastError = error.localizedDescription
         }
+    }
+
+    /// Re-issues the current query under a fresh token. A new token means a new
+    /// flood through the distributed network, reaching peers the first pass
+    /// missed; late replies to the old token are ignored because `activeToken`
+    /// has moved on.
+    private func retrySearch() async {
+        guard !query.isEmpty, isConnected else { return }
+        searchRetried = true
+        let token = UInt32.random(in: 1...UInt32.max)
+        activeToken = token
+        await send(query, token: token)
     }
 
     /// Explains anything surprising about this search before the user waits
@@ -213,8 +248,11 @@ final class Session {
                 + "wording."
         }
         if normalized != raw {
-            return "Searching for \(normalized) — punctuation is removed "
-                + "because peers match each word against the file's folder path."
+            // Peers tokenize on non-alphanumeric boundaries, so they would drop
+            // this punctuation anyway. It is removed here so the query shown is
+            // the query sent, and because a term starting with "-" reads as
+            // "exclude this word" to some clients.
+            return "Searching for \(normalized)"
         }
         return nil
     }
@@ -230,8 +268,18 @@ final class Session {
     private func startSearchDeadline(for token: UInt32) {
         searchDeadline?.cancel()
         searchDeadline = Task { [weak self] in
-            try? await Task.sleep(for: Self.searchTimeout)
+            try? await Task.sleep(for: Self.searchRetryDelay)
             guard !Task.isCancelled, let self, self.activeToken == token else { return }
+
+            // Nothing at all after the first pass: try a second flood before
+            // telling the user the network had no answer.
+            if self.results.isEmpty, !self.searchRetried {
+                await self.retrySearch()
+                return
+            }
+
+            try? await Task.sleep(for: Self.searchTimeout - Self.searchRetryDelay)
+            guard !Task.isCancelled, self.activeToken == token else { return }
             self.isSearching = false
         }
     }
@@ -312,6 +360,7 @@ final class Session {
                 switch event {
                 case .results(let token, let incoming):
                     guard token == self.activeToken else { continue }
+                    self.searchReplyCount += 1
                     self.isSearching = false
                     self.results.append(contentsOf: incoming)
                 case .excludedPhrases(let phrases):
@@ -319,6 +368,7 @@ final class Session {
                     // refuses to carry can be named as such instead of just
                     // returning nothing.
                     self.excludedPhrases = phrases
+                    self.receivedExcludedPhrases = true
                 case .wishlistInterval, .folderContentsResponse:
                     continue
                 }
