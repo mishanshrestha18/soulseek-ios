@@ -29,13 +29,15 @@ struct ServerMessageRoundTripTests {
         let (pass, pLen) = msg.readString(at: o)!; o += pLen
         #expect(pass == "secret")
         let version = msg.readUInt32(at: o)!; o += 4
-        #expect(version == 169)
+        // 177 is the major version reserved for experimental clients. 169
+        // belongs to seeleseek and must not be sent by anything else.
+        #expect(version == 177)
         // MD5 hash string
         let (hash, hLen) = msg.readString(at: o)!; o += hLen
         #expect(hash.count == 32) // MD5 hex = 32 chars
         // Minor version
         let minor = msg.readUInt32(at: o)!
-        #expect(minor == 3)
+        #expect(minor == 1)
     }
 
     @Test("setListenPort message")

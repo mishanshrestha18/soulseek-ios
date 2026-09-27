@@ -32,6 +32,16 @@ iOS, despite the package already declaring `.iOS(.v18)`:
 
 Worth sending upstream: the package claims iOS support it does not have.
 
+### `0002-client-version.patch`
+
+`MessageBuilder.loginMessage` sent major version `169`, which the protocol
+documentation reserves for seeleseek. This is a different client, and the
+documentation asks clients not to impersonate each other's reserved majors —
+the server uses the number to tell clients apart. Now sends `177`, the number
+set aside for experimental clients, with minor version `1`.
+
+Not for upstream: 169 is correct *for* seeleseek.
+
 ### `Package.swift`: test target isolation
 
 Not in `Patches/` since `Package.swift` is not part of the vendored Sources

@@ -16,6 +16,13 @@ final class Session {
     private(set) var status: ConnectionStatus = .disconnected
     private(set) var lastError: String?
 
+    /// The server's raw login rejection reason, when the last attempt failed
+    /// because of the credentials rather than the network. Kept separate from
+    /// `lastError` so stored credentials are only discarded when the server
+    /// actually rejected them — a dropped connection must not wipe a password
+    /// that works.
+    private(set) var loginRejection: String?
+
     private(set) var results: [SearchResult] = []
     private(set) var isSearching = false
     private(set) var query = ""
@@ -96,8 +103,55 @@ final class Session {
         // gives a reason string, and there is no password reset, so the user
         // needs to see exactly what it said.
         if await !client.loggedIn {
-            lastError = await client.connectionError ?? "Could not sign in."
+            let reason = await client.connectionError
+            loginRejection = reason
+            lastError = Self.explain(reason)
+        } else {
+            loginRejection = nil
         }
+    }
+
+    /// True when the server rejected the credentials themselves. A timeout or
+    /// socket error is not this, and must not cause a working password to be
+    /// thrown away.
+    var credentialsRejected: Bool {
+        guard let reason = loginRejection else { return false }
+        return ["INVALIDPASS", "INVALIDUSERNAME", "EMPTYPASSWORD"]
+            .contains { reason.contains($0) }
+    }
+
+    /// The wire reasons are bare tokens like `INVALIDPASS`, which tell the user
+    /// nothing. INVALIDPASS is the confusing one: Soulseek registers an account
+    /// on first login, so it means the name is already taken by somebody else
+    /// far more often than it means a typo.
+    private static func explain(_ reason: String?) -> String {
+        guard let reason else { return "Could not sign in." }
+
+        if reason.contains("INVALIDPASS") {
+            return "That username is already registered to someone else, and "
+                + "the password does not match it. Soulseek creates your "
+                + "account on first login, so choose a different, more "
+                + "distinctive username — unless the account is yours, in "
+                + "which case check the password."
+        }
+        if reason.contains("EMPTYPASSWORD") {
+            return "The password cannot be empty."
+        }
+        if reason.contains("INVALIDUSERNAME") {
+            // The server appends a detail: empty, too long (max 30 characters),
+            // non-printable-ASCII, or leading/trailing spaces.
+            return "That username is not allowed. \(reason)"
+        }
+        if reason.contains("INVALIDVERSION") {
+            return "The server rejected this client version."
+        }
+        if reason.contains("SVRFULL") {
+            return "The server is not accepting connections right now. Try again shortly."
+        }
+        if reason.contains("SVRPRIVATE") {
+            return "The server is not accepting new account registrations."
+        }
+        return reason
     }
 
     func disconnect() async {

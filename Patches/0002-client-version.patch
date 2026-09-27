@@ -1,0 +1,29 @@
+diff --git a/Packages/SeeleseekCore/Sources/SeeleseekCore/Network/Protocol/MessageBuilder.swift b/Packages/SeeleseekCore/Sources/SeeleseekCore/Network/Protocol/MessageBuilder.swift
+index 035a6ae..b49ac78 100644
+--- a/Packages/SeeleseekCore/Sources/SeeleseekCore/Network/Protocol/MessageBuilder.swift
++++ b/Packages/SeeleseekCore/Sources/SeeleseekCore/Network/Protocol/MessageBuilder.swift
+@@ -12,8 +12,11 @@ public enum MessageBuilder {
+             $0.appendString(username)
+             $0.appendString(password)
+ 
+-            // Client version
+-            $0.appendUInt32(169)
++            // Major version. 169 is seeleseek's reserved number and this is a
++            // different client — the protocol documentation asks clients not to
++            // impersonate each other's reserved majors. 177 is the number set
++            // aside for experimental clients, which this is.
++            $0.appendUInt32(177)
+ 
+             // MD5 hash of username + password
+             let hashInput = username + password
+@@ -22,8 +25,8 @@ public enum MessageBuilder {
+             let hashHex = digest.map { String(format: "%02x", $0) }.joined()
+             $0.appendString(hashHex)
+ 
+-            // Minor version
+-            $0.appendUInt32(3)
++            // Minor version: free choice under major 177.
++            $0.appendUInt32(1)
+         }
+     }
+ 
