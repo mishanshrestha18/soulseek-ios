@@ -29,6 +29,31 @@ struct SearchView: View {
         ResultFolder.group(visibleResults)
     }
 
+    /// A rescue for a multi-word query that no peer answered while its
+    /// individual words do get answers — "linkin park" draws nothing, "linkin"
+    /// draws 55 peers. Whatever upstream filtering causes that is not reachable
+    /// from here, but the intended search is: send the word the network will
+    /// carry and require the rest locally.
+    ///
+    /// Picks the longest word to send, as the most distinctive and so the one
+    /// returning the least noise to narrow.
+    private var splitSuggestion: (send: String, require: String)? {
+        guard !session.isSearching, session.searchReplyCount == 0 else { return nil }
+        let terms = session.query.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard terms.count >= 2, let pivot = terms.max(by: { $0.count < $1.count }) else {
+            return nil
+        }
+        let rest = terms.filter { $0.caseInsensitiveCompare(pivot) != .orderedSame }
+        guard !rest.isEmpty else { return nil }
+        return (pivot, rest.joined(separator: " "))
+    }
+
+    private func runSplit(_ split: (send: String, require: String)) {
+        filter.required = split.require
+        text = split.send
+        Task { await session.search(split.send) }
+    }
+
     var body: some View {
         NavigationStack {
             Group {
@@ -207,6 +232,17 @@ struct SearchView: View {
                 Text("\(session.results.count) results are hidden by your filters.")
             } actions: {
                 Button("Clear filters") { filter = SearchFilter() }
+            }
+        } else if let split = splitSuggestion {
+            ContentUnavailableView {
+                Label("No peer answered", systemImage: "exclamationmark.magnifyingglass")
+            } description: {
+                Text("Some phrases draw no replies even when their words do. Search \(split.send) instead and require \(split.require) in the results.")
+            } actions: {
+                Button("Search \(split.send), require \(split.require)") {
+                    runSplit(split)
+                }
+                Button("Search by artist and album") { showingFields = true }
             }
         } else {
             ContentUnavailableView {

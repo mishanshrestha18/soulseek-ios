@@ -19,6 +19,15 @@ struct SearchFilter: Equatable {
     /// The desktop client's exclusion field behaves the same way.
     var excluded = ""
 
+    /// Space-separated words that must all appear in the path.
+    ///
+    /// This is not just a convenience. Some phrases draw zero replies from the
+    /// network even though each of their words draws plenty — "linkin park"
+    /// returns nothing while "linkin" returns results from 55 peers. Filtering
+    /// here recovers the intended search: ask the network for a term it will
+    /// carry, then narrow the answer locally.
+    var required = ""
+
     static let bitrateOptions = [0, 128, 192, 256, 320]
     static let sizeOptions = [0, 1, 5, 10, 50]
 
@@ -33,6 +42,7 @@ struct SearchFilter: Equatable {
         if minBitrate > 0 { count += 1 }
         if minSizeMB > 0 { count += 1 }
         if !excludedWords.isEmpty { count += 1 }
+        if !requiredWords.isEmpty { count += 1 }
         return count
     }
 
@@ -43,8 +53,16 @@ struct SearchFilter: Equatable {
             .map(String.init)
     }
 
+    var requiredWords: [String] {
+        required
+            .lowercased()
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+    }
+
     func apply(to results: [SearchResult]) -> [SearchResult] {
         let words = excludedWords
+        let needed = requiredWords
         let minBytes = UInt64(minSizeMB) * 1_048_576
 
         return results.filter { result in
@@ -59,9 +77,12 @@ struct SearchFilter: Equatable {
                 guard let bitrate = result.bitrate, Int(bitrate) >= minBitrate else { return false }
             }
 
-            if !words.isEmpty {
+            if !words.isEmpty || !needed.isEmpty {
+                // Matched against the whole path, not just the file name, so
+                // narrowing on an artist works when the artist is a folder.
                 let haystack = result.filename.lowercased()
                 if words.contains(where: haystack.contains) { return false }
+                if !needed.allSatisfy(haystack.contains) { return false }
             }
             return true
         }

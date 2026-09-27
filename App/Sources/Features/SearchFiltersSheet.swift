@@ -60,6 +60,16 @@ struct SearchFiltersSheet: View {
                 }
 
                 Section {
+                    TextField("park", text: $filter.required)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                } header: {
+                    Text("Must include words")
+                } footer: {
+                    Text("Space separated; every word must appear in the path. Useful when a phrase draws no replies from the network but its individual words do — ask for the word that works, then narrow here.")
+                }
+
+                Section {
                     TextField("live remix karaoke", text: $filter.excluded)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
