@@ -99,7 +99,7 @@ struct SearchView: View {
         } label: {
             SearchResultRow(
                 result: result,
-                status: session.transfers.downloadStatus(
+                snapshot: session.transfers.downloadSnapshot(
                     username: result.username,
                     filename: result.filename
                 )
@@ -233,7 +233,7 @@ private struct FolderRow: View {
                 } label: {
                     SearchResultRow(
                         result: file,
-                        status: session.transfers.downloadStatus(
+                        snapshot: session.transfers.downloadSnapshot(
                             username: file.username,
                             filename: file.filename
                         )
@@ -327,7 +327,7 @@ private struct FilterChip: View {
 
 struct SearchResultRow: View {
     let result: SearchResult
-    let status: Transfer.TransferStatus?
+    let snapshot: DownloadSnapshot?
 
     var body: some View {
         HStack(spacing: 12) {
@@ -378,15 +378,18 @@ struct SearchResultRow: View {
     /// The only signal that a tap did anything until the peer responds.
     @ViewBuilder
     private var statusIcon: some View {
-        switch status {
+        switch snapshot?.status {
         case nil:
             Image(systemName: "arrow.down.circle")
                 .foregroundStyle(.tint)
         case .queued, .waiting:
             Image(systemName: "clock.fill")
                 .foregroundStyle(.orange)
-        case .connecting, .transferring:
+        case .connecting:
+            // No bytes have moved yet, so there is no fraction to draw.
             ProgressView()
+        case .transferring:
+            DownloadProgressRing(fraction: snapshot?.fraction ?? 0)
         case .completed:
             Image(systemName: "checkmark.circle.fill")
                 .foregroundStyle(.green)

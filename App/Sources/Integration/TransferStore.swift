@@ -2,6 +2,12 @@ import Foundation
 import Observation
 import SeeleseekCore
 
+/// What a row needs to draw a download's state: how it is doing, and how far in.
+struct DownloadSnapshot: Equatable {
+    let status: Transfer.TransferStatus
+    let fraction: Double
+}
+
 /// The app side of `TransferTracking`. `DownloadManager` drives this; the UI
 /// only reads it.
 @MainActor
@@ -66,14 +72,19 @@ final class TransferStore: TransferTracking {
 
     // MARK: - Queries for the UI
 
-    /// Status of the newest download for this peer and path, or nil if the file
+    /// State of the newest download for this peer and path, or nil if the file
     /// has never been queued. Lets a search row show that it is already
     /// downloading — without it, tapping a result gives no visible feedback at
     /// all, which reads as the tap having done nothing.
-    func downloadStatus(username: String, filename: String) -> Transfer.TransferStatus? {
+    ///
+    /// Carries progress as well as status so a row can show how far along the
+    /// transfer is without going back to the store for it.
+    func downloadSnapshot(username: String, filename: String) -> DownloadSnapshot? {
         guard let ids = downloadIDsByPeerFile[Self.key(username, filename)] else { return nil }
         for id in ids.reversed() {
-            if let index = downloadPositions[id] { return downloads[index].status }
+            guard let index = downloadPositions[id] else { continue }
+            let transfer = downloads[index]
+            return DownloadSnapshot(status: transfer.status, fraction: transfer.progress)
         }
         return nil
     }

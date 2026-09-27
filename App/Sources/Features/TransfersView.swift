@@ -123,7 +123,13 @@ private struct TransferRow: View {
 
             Spacer(minLength: 0)
 
-            if let url = playableURL {
+            // The trailing slot is never contested: a transfer in flight cannot
+            // also be a finished file waiting to be played.
+            if transfer.status == .transferring {
+                DownloadProgressRing(fraction: transfer.progress)
+            } else if transfer.status == .connecting {
+                ProgressView()
+            } else if let url = playableURL {
                 Button {
                     Task { await player.toggle(url: url) }
                 } label: {
